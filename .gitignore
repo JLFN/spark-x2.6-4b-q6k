@@ -1,0 +1,6 @@
+# artifacts and the source checkpoint live on disk, not in git
+models/*.gguf
+models/hf/
+
+# build scratch
+out/build/
