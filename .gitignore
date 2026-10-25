@@ -4,3 +4,4 @@ models/hf/
 
 # build scratch
 out/build/
+models/server.log
