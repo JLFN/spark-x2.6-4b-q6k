@@ -1,9 +1,11 @@
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD is this handoff commit,
-working tree clean. Remote https://github.com/JLFN/spark-x2.6-4b-q6k is at
-9f988c7, so these are unpushed: add6d67 (the C and Rust stream-width fix),
-4c62df9 (the tiled prefill kernel and its gates), and this handoff commit.
+Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD is 71b6428 and
+origin/master is at the same commit. The working tree is NOT clean:
+tools/vq-format/ and tools/vq-runtime/ are new and uncommitted, and
+tools/Cargo.toml, tools/Cargo.lock and tools/dqvq/src/main.rs are modified.
+They are the CPU f32 reference runtime, which builds but was not gated,
+committed or timed before this handoff.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -24,7 +26,11 @@ result. Where a number is missing it says so.
 - Prefill is MEASURED now: 512 tokens in 293.8 ms (1742.8 tok/s) in the C
   driver and 269.9 ms (1896.7 tok/s) in the Rust harness, on the tiled f16
   kernel. The legacy kernel is 14.6x slower on the same bytes.
-- VQ runtime: still does not exist. Nothing but these tools decodes the format.
+- VQ runtime: a CPU f32 reference now exists in the working tree (uncommitted:
+  tools/vq-format, tools/vq-runtime). It loads the bf16 checkpoint or an RQVQ
+  artifact and runs a full forward pass over token ids, but it is a reference,
+  not a fast runtime: it streams f32 weights per token and has not been gated
+  or timed.
 
 ## 2. Measurements (do not re-derive)
 
@@ -109,15 +115,44 @@ dim 8 with 8192, and the DQVQ build of 8192):
 
 ## 4. Open work, in priority order
 
-1. Push: three commits local, origin at 9f988c7.
-2. A VQ runtime. Nothing serves these containers yet; a decode-rate or a
-   prefill-rate number is not a model. This is the last thing between the
-   format and a usable artifact.
-3. Prefill tuning, only if a runtime needs it. The B-tile load reads xT
+1. Commit the VQ reference runtime. tools/vq-format and tools/vq-runtime are
+   uncommitted and nothing in them has been gated. The gate: C decode equals
+   Rust decode (already exact), then vq-runtime logits against the bf16
+   checkpoint at a fixed prompt, then a timing run. No runtime speed should be
+   quoted before that run exists.
+2. GPU model runtime. The CPU f32 reference streams about 16.45 GB per token,
+   which caps it near 3-4 tok/s on realistic CPU bandwidth. The measured
+   kernels in bin/decode-gpu (block GEMV at 299 GB/s, tiled prefill at
+   1742-1897 tok/s) are the pieces a model-level runtime needs; wiring them is
+   the real speed step.
+3. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
+   DSpark is this model's MTP equivalent and it is already wired on the
+   llama.cpp path (measured 1.13-1.40x there), but it is not wired into the VQ
+   runtime and should not be until item 2 makes the base fast enough for
+   speculation to pay. When it is taken up, the work is: expose target hidden
+   states at five layers, load the draft GGUF, implement the 5-block SWA
+   dflash graph with attn_gate and gelu, then the propose/verify loop.
+   Acceptance against a VQ target is unmeasured and must be measured, because
+   the draft was trained on bf16 hidden states and VQ shifts them (manifest
+   relL2 about 2.8-3.4 per tensor).
+
+Why "add MTP" is not an option, checked 2026-10-31: the released checkpoint has
+no MTP layers. model.safetensors.index.json has no mtp or nextn tensors,
+models/hf/config.json has no next-token-prediction field, and
+models/hf/modeling_spark.py has no MTP path. The DSpark draft is the vendor's
+trained multi-token module, shipped separately: its GGUF has no
+token_embd.weight and no output.weight, only output_norm.weight, so it borrows
+the target's embedding and LM head and consumes hidden states at
+dflash.target_layers (the card lists [2, 10, 18, 25, 33]). That is the
+EAGLE-style pattern, a separate 624 M draft fed by target features, not an
+in-checkpoint MTP head. Anything called "fixing MTP" would mean training a
+new module, not repairing one.
+
+4. Prefill tuning, only if a runtime needs it. The B-tile load reads xT
    column-major and writes shared token-major (4-way bank conflict on a path
    that is a minor share of the traffic); a 256-token tile would halve the
    A-tile decode per token if shared memory allowed it.
-4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
+5. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
    also lose both fast kernels, so expect the per-index rates.
 
 ## 5. Resume
