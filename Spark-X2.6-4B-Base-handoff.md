@@ -1,7 +1,7 @@
 # Spark-X2.6-4B-Base — session handoff
 
 Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
-carries this handoff (docs(handoff): the per-model kernel tuner), and
+carries this handoff (docs(agents): how to use the kernel tuner), and
 origin/master is behind it until the push is approved. The working tree is
 clean once that commit exists.
 

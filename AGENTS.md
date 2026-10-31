@@ -493,24 +493,100 @@ prints that it does. `--no-prefill` forces the token-by-token path and
 
 ## 8c. Tune the VQ kernels per model (bin/vq-tune)
 
-The kernel shapes are no longer build constants. The tiled prefill is a
-template over its tile (BN token tile, BK column round) and its codebook
-placement, and the GEMV takes a launch width. `bin/vq-tune` measures the legal
-choices on one artifact's real payloads and writes `<artifact>/vq-tune.profile`;
-`bin/vq-model-gpu` and `bin/vq-bench` read that file when it matches the
-artifact and the device, and keep the readiness heuristic otherwise.
+The kernel shapes are not build constants. The tiled prefill is a template over
+its tile (BN token tile, BK column round) and its codebook placement, and the
+GEMV takes a launch width. `bin/vq-tune` measures the legal choices on one
+artifact's real payloads and writes `<artifact>/vq-tune.profile`.
+`bin/vq-model-gpu` reads that file when it matches the artifact and the device.
+`bin/vq-bench` does not read it: the harness keeps the readiness heuristic, so
+its rates describe the default shapes (see the note at the end). Whenever a
+profile is missing or refused, the runtime falls back to the heuristic and
+prints why, on one line, before it loads weights.
+
+Quick start:
 
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7
-    ./bin/vq-model-gpu --dir DIR --ids LIST              # uses the profile
-    ./bin/vq-model-gpu --dir DIR --ids LIST --no-tune    # heuristic only
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids <same> --gen 8 --ctx 512 --no-tune
 
-Per distinct matrix geometry (6 in this model, not 216) it asks the library
-which variants and tiles are legal, times each on the real container with CUDA
-events, rejects any candidate whose output moves past relL2 1e-4 against the
-default, and keeps the fastest. A 3.2 GB artifact sweeps in about 4 s. The
-profile is bound to the artifact fingerprint (FNV-1a over manifest.txt and the
-two 4 KB edges of every container) and to the device name; a foreign or stale
-profile is refused with a printed reason, never applied.
+The first command writes `models/vq-build-8192-2-v3/vq-tune.profile`; the
+second run prints `profile ... matches artifact <hex> on <gpu> (12 entries,
+driver 13.3)` and uses it; the third ignores it, which is the A/B baseline.
+
+What the sweep does. It reads manifest.txt, groups the matrices into their
+distinct geometries (six in a full model, not 216), asks the library which
+GEMV variants, launch widths and prefill tiles each geometry can legally run,
+times each on the real containers with CUDA events (`--iters` launches, best
+of them), rejects any candidate whose output moves past relL2 1e-4 against the
+default, and keeps the fastest. A 3.2 GB artifact sweeps in about four
+seconds. Nothing is guessed: a variant or tile the kernel library reports as
+illegal is never launched, and a rejected candidate is printed with its relL2.
+
+Reading the output. One block per geometry, then two lines:
+
+    2560x10240 dim 4 nc 8192 DQV3 (36 matrices, 2 stages)
+      gemv    variant 3 threads 256   328.1 GB/s   (runner-up variant 3 threads 512: 324.9)
+      prefill variant 2 tile 64x64   321246.4 tok/s   (runner-up variant 2 128x64: 272349.7)
+
+The header is rows x cols, the payload width, the payload format, and how many
+matrices share that geometry. The gemv rate is container bytes over the summed
+best time of the matrix's stages (the same accumulation the runtime does). The
+prefill rate is tokens over the same summed time at `--tokens`, and "legacy"
+means no tiled tile fits that geometry. A tiny matrix (g_proj is 16 rows) shows
+a low GB/s because the launch, not the bandwidth, is the cost; that is expected
+and the tuner still records its winner.
+
+The profile file is plain text, one directive per line, and is safe to read:
+
+    VQPROF 1
+    artifact 173b2f06d538deb8
+    gpu NVIDIA GeForce RTX 4070 SUPER
+    driver 13.3
+    gemv 4 8192 2560 10240 1 3 256 328.1
+    prefill 4 8192 2560 10240 1 2 64 64 321246.4
+
+The fields after the tag are dim, nc, rows, cols, v3, then for `gemv` the
+variant (0 shared codebook, 1 generic warp, 2 dim-4 warp, 3 DQV3 block), the
+launch width, and the measured GB/s; for `prefill` the variant (1 tiled with
+the codebook in L1, 2 tiled with it in shared, 3 legacy), the tile (BN, BK),
+and the measured tok/s. The trailing rate is informational; the reader
+ignores it. The file is written through a temporary and renamed, so a reader
+never sees a partial profile, and it lives under `models/`, which git ignores.
+
+When to re-tune: after building a new artifact (the fingerprint changes and the
+old profile is refused), on a different GPU (the device name changes), and
+after a toolkit or driver change if the margins matter (the driver is recorded
+in the file but not matched, so a re-tune is recommended rather than enforced).
+Do not copy a profile between artifacts to save four seconds.
+
+Refusals are explicit and never silent. The runtime prints one of:
+
+    profile     PATH is absent or not version 1; using heuristics
+    profile     PATH was tuned on artifact <a>, this one is <b>; ignored
+    profile     PATH was tuned on <gpu>, this device is <gpu>; ignored
+    profile     none; DIR/manifest.txt could not be fingerprinted
+
+and per entry, if a hand-edited or stale profile names something illegal:
+
+    profile: gemv entry for RxC is not runnable here; heuristic kept
+
+The fingerprint is FNV-1a over manifest.txt and the first and last 4 KB of
+every matrix container, computed identically by the Rust writer and the C
+reader. `--no-tune` skips the file entirely; `--profile PATH` overrides the
+lookup path.
+
+Useful variants of the tuner:
+
+    ./bin/vq-tune DIR --dry-run                  # sweep and report, write nothing
+    ./bin/vq-tune DIR --force                    # replace a profile from another artifact
+    ./bin/vq-tune DIR --profile /tmp/p          # write elsewhere
+    ./bin/vq-tune DIR --tokens 128 --iters 5    # judge a 128-token prompt instead
+
+What is not tuned: the attention, norm, rope and transpose kernels, the
+runtime's chunk size (tune with `--tokens` matching `--chunk` if you change
+it), and anything per layer (matrices that share a geometry share an entry,
+and the sweep shows the winner depends on the shape, not the layer). BK 128 is
+also absent by construction (see the rules below).
 
 Measured 2026-10-31, 4x8192 x2 (DQV3), 12 entries:
 
@@ -523,19 +599,19 @@ Measured 2026-10-31, 4x8192 x2 (DQV3), 12 entries:
 | 2560x4096 out | 36 | 274.8 | v2 64x64 | 788,644 |
 | 6144x2560 qkv | 36 | 337.7 | v2 64x64 | 545,275 |
 
-The profile is numerically neutral, not merely inside the f16 gate: the tile
-shape changes which tokens share a block, never the per-token K order, so
-logits against `--no-tune` are relL2 0.000000%, maxabs 0, top-100 100/100,
-KL 0 both directions. The model-level effect is the prompt rate: 500 tokens
-917.8 tok/s against 892.3 on the heuristic (+2.9%); decode is unchanged within
-run-to-run noise (64.3 against 62.4 tok/s in one pair of runs, 70.8 measured
-earlier on the same artifact). Most of the prompt time is still the batched
-attention, the transposes and the norms, not the matrix kernels.
+The profile is numerically neutral, not merely inside the f16 gate: a tile
+changes which tokens share a block, never the per-token K order, so logits
+against `--no-tune` are relL2 0.000000%, maxabs 0, top-100 100/100, KL 0 both
+directions. The model-level effect is the prompt rate: 500 tokens 917.8 tok/s
+against 892.3 on the heuristic (+2.9%) on 4x8192 x2, and 749.4 against 734.8
+(+2.0%) on 4x4096 x3. Decode is unchanged within run-to-run noise (64.3
+against 62.4 tok/s in one pair of runs). Most of the prompt time is still the
+batched attention, the transposes and the norms, not the matrix kernels.
 
 DQVQ artifacts sweep too, but their payload has no tiled prefill path at all
 (the round map reads the row-local DQV3 stream), so the profile records the
 legacy prefill for every geometry and the runtime keeps the token-by-token
-prompt and prints why. Only the GEMV choice differs on those artifacts.
+prompt and prints why. Only the GEMV choice differs there.
 
 Two rules a change must preserve:
 
@@ -544,6 +620,12 @@ Two rules a change must preserve:
 - BK 128 is not offered. The A-tile extracts four code words from one 64-bit
   window; BK 128 needs eight (96 bits) and would truncate silently. Adding it
   means a three-word 96-bit window first, the shape v3_rounds already uses.
+
+For the bench: `vq-bench` picks its own variants from readiness (block, then
+dim-4, then generic; tiled with the shared codebook, then L1, then legacy) and
+always uses the default 128x64 tile, so its artifact-only numbers are the
+heuristic's ceiling. Compare the runtime against the bench only with that in
+mind, and use `--no-tune` to reproduce the bench's matrix path in the runtime.
 
 ## 9. Pitfalls that cost time here
 
