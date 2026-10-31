@@ -1,7 +1,9 @@
 # Recipe: a VQ build of Spark-X2.6-4B
 
 Status: encoder in-repo and working; no runnable VQ Spark yet. The measurements
-below are the reason the next step is a decision, not a build order.
+below are the reason the next step is a decision, not a build order. AGENTS.md
+section 5 carries the fuller sweep, the whole-checkpoint builds and the
+whole-model k-quant comparison measured after this file was written.
 
 ## 1. Verdict first
 
