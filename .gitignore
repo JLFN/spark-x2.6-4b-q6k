@@ -3,10 +3,12 @@ models/*.gguf
 models/hf/
 models/dspark/*.gguf
 models/dspark/*.log
+models/instruct/*.gguf
 
 # build scratch
 out/build/
 models/server.log
+models/server-*.log
 
 # graphify-rs output
 graphify-out/

@@ -17,7 +17,7 @@ context on a 12 GB card.
 | Decode, MEASURED | 84.9 tok/s (11.78 ms/token) at a 131072-token context allocation |
 | open-grok | registered as `spark2.6-4b-q6k`, `context_window = 131072` |
 | Quality gate | NOT RUN — perplexity and KL against the BF16 GGUF are the precondition for publishing |
-| DSpark pairing | WORKS on the XHToken fork, 1.30-1.40x decode on normal text at 128K (section 12) |
+| DSpark pairing | WORKS on the XHToken fork; 1.13-1.40x decode at 128K on Q4_K_M instruct and Q6_K base (section 12) |
 | Hugging Face | not published; plan is section 8 |
 
 ## 1. Target host
@@ -220,8 +220,10 @@ the 0.25 partial rotary factor. No new kernels: Q6_K and Q8_0 already exist in
 The draft is not a merge partner: `XHToken/Spark-X2.6-4B-DSpark-GGUF` is a 624 M
 parameter draft model for speculative decoding, 5 sliding-window layers, BF16,
 7 proposed tokens per pass, trained to read target hidden states at layers
-`[2, 10, 18, 25, 33]`. Pairing it with the Q6_K target is the legitimate
-"combination"; anything that merges weights would be a new model, not this one.
+`[2, 10, 18, 25, 33]`. Pairing it with a target is the legitimate "combination";
+anything that merges weights would be a new model, not this one. The supported
+target, and the default of `models/run-spark26-dspark.sh`, is the official
+post-trained `XHToken/Spark-X2.6-4B-GGUF` Q4_K_M; the local Base Q6_K also runs.
 
 Measured facts:
 
@@ -232,7 +234,8 @@ Measured facts:
 | Required toolchain | XHToken fork `/data/llama.cpp-xhtoken` @ `22c0ae1871b60123c5afc008a78fe9c6fffa2858` |
 | Upstream `fa3645feb` | FAILS: `check_tensor_dims: tensor 'blk.0.attn_q_norm.weight' not found` |
 | Fork build fix | `src/llama-context.cpp` needs `#include <algorithm>` (uses `std::all_of`) |
-| Load test | both models load, server answers on 127.0.0.1:8092 |
+| Load test | both targets load, server answers on 127.0.0.1:8090 |
+| Instruct target | `Spark-X2.6-4B-Q4_K_M.gguf`, 3,543,441,312 B, sha256 `91cb2811...f5cbd9` (matches the Hub LFS hash) |
 
 Why upstream fails, with the evidence: the released draft stores `blk.0.attn_gate.weight`
 and no `attn_q_norm` (checked with `strings` on the GGUF). The fork's
@@ -256,12 +259,36 @@ against the post-trained Spark-X2.6-4B, not against this BASE checkpoint. The ca
 reports a mean acceptance length of 4.0-5.2 (about 2x speed) on its intended target;
 here the mean length is 2.4-2.6 and the gain is 1.3-1.4x on normal text.
 
+Second measurement, the intended pair: official Q4_K_M instruct target at 128K with
+q8_0 KV, chat requests at temperature 1.0 / top_p 0.95, 400 tokens.
+
+| Target | No draft | With draft | Acceptance | Mean len | VRAM with draft |
+|---|---:|---:|---:|---:|---:|
+| Q4_K_M instruct | 107.1 / 106.7 / 107.7 tok/s | 122.7 / 120.8 / 149.8 tok/s | 0.22 / 0.21 / 0.31 | 2.55 / 2.46 / 3.17 | 8,837 MiB |
+| Q4_K_M instruct, no draft | — | — | — | — | 7,127 MiB |
+
+So the intended pair gains 1.13-1.40x here, and the instruct target does not lift
+acceptance above the Base target's 0.20-0.30. A likely cause, not yet proven: the
+card's numbers come from benchmark tasks on a 4090, while these prompts are generic
+prose. The 2x figure should not be expected on this card.
+
+Base-target loop, measured: under greedy decoding the chat template drives the BASE
+checkpoint into an endless `\n\n\n<think>\n</think>` cycle, and it never emits EOS,
+so a request without `max_tokens` fills the whole context (72,012 tokens observed,
+about 8 minutes at 200 tok/s). The BF16 build loops identically, so this is model
+behavior, not quantization damage. Send temperature 0.8-1.0 with a light repeat
+penalty and always send `max_tokens`. The instruct target does not reproduce it.
+
+
 Risks:
 
-- The draft and target are different checkpoints (post-trained draft, base target).
-  Function works; acceptance is the measured cost, not an assumption.
-- 128K with f16 KV leaves 1,018 MiB. Any other GPU job needs `KV=q8_0` or a smaller
-  `CTX`; q8_0 KV keeps 2,723 MiB free at the same context.
+- The draft was trained against the post-trained checkpoint; pairing it with the
+  Base target works but measures 0.20-0.30 acceptance, and the instruct target
+  measured 0.21-0.31, both far below the card's 4.0-5.2 mean length. Acceptance is
+  measured here, not assumed.
+- 128K with f16 KV on the Base target leaves 1,018 MiB. Any other GPU job needs
+  `KV=q8_0` or a smaller `CTX`; q8_0 KV keeps 2,723 MiB free at the same context.
+  The Q4_K_M pair keeps 3,445 MiB free with q8_0 KV.
 - The fork is a third-party branch three days younger than the upstream pin, and it
   is built with one local source fix. Treat it as a separate toolchain, not as
   upstream.

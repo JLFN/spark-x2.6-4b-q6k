@@ -40,35 +40,46 @@ following instructions.
 ## Speculative decoding with the DSpark draft
 
 The upstream draft [`XHToken/Spark-X2.6-4B-DSpark-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-DSpark-GGUF)
-(624 M parameters, 5 SWA layers, BF16, 1.25 GB) can be paired with this Q6_K target.
-It is the only way to "combine" the two: the draft is not a weight merge, it
-proposes up to 7 tokens per pass and the target verifies them.
+(624 M parameters, 5 SWA layers, BF16, 1.25 GB) is the supported multi-token
+accelerator for Spark: it is not a weight merge, it proposes up to 7 tokens per
+pass and the target verifies them. It runs against two different targets here.
 
-    ./models/run-spark26-dspark.sh                    # 128K, q8_0 KV, port 8090
-    KV=f16 ./models/run-spark26-dspark.sh             # fits, 1,018 MiB free
+The default target is the official post-trained Q4_K_M, the pair the draft was
+trained against and the only one that also behaves as an instruct model:
+
+    ./models/run-spark26-dspark.sh
+    MODEL="$PWD/models/spark26-4b-Q6_K.gguf" ./models/run-spark26-dspark.sh
     CTX=32768 ./models/run-spark26-dspark.sh
 
-This needs the XHToken llama.cpp fork, not `/data/llama.cpp`: the released draft
-stores a per-head `attn_gate` where the 2026-10-25 upstream `dflash` loader expects
-`attn_q_norm`/`attn_k_norm`, so upstream fails with
+Both targets need the XHToken llama.cpp fork, not `/data/llama.cpp`: the released
+draft stores a per-head `attn_gate` where the 2026-10-25 upstream `dflash` loader
+expects `attn_q_norm`/`attn_k_norm`, so upstream fails with
 `tensor 'blk.0.attn_q_norm.weight' not found`. Build the fork at
 `/data/llama.cpp-xhtoken` (commit `22c0ae1`, plus an `#include <algorithm>` fix that
 its `llama-context.cpp` is missing under gcc 14).
 
-Measured on this machine, greedy, 256-token continuations, same fork binary:
+Measured on this machine, 128K context, q8_0 KV, chat requests at temperature 1.0
+and top_p 0.95, 400 tokens, same fork binary:
 
-| Context, KV | Decode, no draft | Decode, with draft | Draft acceptance | VRAM |
-|---|---:|---:|---:|---:|
-| 128K, q8_0 | — | 116.5-138.2 tok/s | 0.20-0.30 | 9,172 MiB |
-| 128K, f16 | 98.1 / 94.7 / 94.6 tok/s | 123.0 / 125.4 tok/s | 0.20 / 0.23 | 10,876 MiB |
-| 32K, f16 | 98.7 / 96.2 / 95.9 tok/s | 139.0 / 132.0 tok/s | 0.23 / 0.23 | 7,343 MiB |
+| Target | Decode, no draft | Decode, with draft | Draft acceptance | Mean accept len | VRAM with draft |
+|---|---:|---:|---:|---:|---:|
+| Q4_K_M instruct (3.54 GB) | 107.1 / 106.7 / 107.7 tok/s | 122.7 / 120.8 / 149.8 tok/s | 0.22 / 0.21 / 0.31 | 2.55 / 2.46 / 3.17 | 8,837 MiB |
+| Q6_K base (3.46 GB) | 98.1 / 94.7 / 94.6 tok/s | 123.0 / 125.4 tok/s | 0.20 / 0.23 | — | 10,876 MiB (f16 KV) |
 
-On repetitive text the acceptance rises to 0.96 and decode to 285-299 tok/s. The
-low acceptance on normal text is expected: the draft was trained against the
-post-trained Spark-X2.6-4B, while this target is the BASE checkpoint, so it is a
-1.3-1.4x gain here versus the roughly 2x the draft reaches on its intended target.
-Quality is unchanged — speculative decoding only changes which tokens are proposed,
-the target still samples every accepted token.
+So the pairing is a 1.13-1.40x gain of real decode speed here, not the roughly 2x
+the draft's card reports on a 4090, and the instruct target does not raise
+acceptance as much as its provenance suggested. Treat 1.1-1.4x as the honest
+expectation on a 12 GB RTX 4070 SUPER. Quality is unchanged by the draft itself:
+speculative decoding only changes which tokens are proposed, the target still
+samples every accepted token.
+
+One trap with the BASE target, measured today: under greedy decoding the chat
+template drives it into an endless `\n\n\n<think>\n</think>` loop, and the loop
+does not stop at EOS, so without a `max_tokens` it fills the whole context
+(72,000 tokens observed). The unquantized BF16 build loops identically, so this is
+model behavior, not quantization damage. Send temperature 0.8-1.0 with a small
+repeat penalty, and always send `max_tokens`. The instruct target does not
+reproduce the loop.
 
 ## Layout
 
@@ -77,9 +88,10 @@ the target still samples every accepted token.
       spark26-4b-Q6_K.gguf    3.46 GB, the artifact
       spark26-4b-bf16.gguf    8.22 GB, the gate reference (not for publishing)
       SHA256SUMS              both hashes
-      run-spark26.sh          the server launcher
-      run-spark26-dspark.sh   the launcher with the DSpark draft
+      run-spark26.sh          the server launcher for the local Q6_K build
+      run-spark26-dspark.sh   the launcher with the DSpark draft (default target: official Q4_K_M)
       dspark/                 the DSpark draft GGUF and its run logs (not in git)
+      instruct/               the official post-trained Q4_K_M target (not in git)
       hf/                     the source checkpoint at the pinned revision
       *.log                   download, convert, quantize, server logs
     docs/             gate receipts, once section 7 runs
@@ -95,6 +107,9 @@ the target still samples every accepted token.
   (XHToken fork, CUDA sm_89) plus the `<algorithm>` include fix; required for the draft.
 - Draft: `XHToken/Spark-X2.6-4B-DSpark-GGUF`, `Spark-X2.6-4B-DSpark.gguf`,
   1,254,293,824 B, sha256 `2ee073c18870c66d7fbc8e124fd8d6c2364c8a83e4bbbc3ebaeaa9660eedeac8`.
+- Instruct target: `XHToken/Spark-X2.6-4B-GGUF`, `Spark-X2.6-4B-Q4_K_M.gguf`,
+  3,543,441,312 B, sha256 `91cb2811aebb47ac916aa619d27d4cdd7f4143106b7917accb8ead4cd7f5cbd9`,
+  Apache-2.0, post-trained, 290 tensors with the same names as the Base checkpoint.
 
 ## Before publishing
 

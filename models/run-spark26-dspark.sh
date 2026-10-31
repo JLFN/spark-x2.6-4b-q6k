@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Serve the Q6_K target with the Spark-X2.6-4B-DSpark draft for speculative decoding.
+# Serve a Spark target with the Spark-X2.6-4B-DSpark draft for speculative decoding.
+#
+# Default target is the official post-trained Q4_K_M (XHToken/Spark-X2.6-4B-GGUF),
+# the pairing the draft was trained against. Point MODEL=... at the local Base
+# Q6_K build to pair the draft with that target instead; it runs, but acceptance
+# drops from about 0.21-0.32 to 0.20-0.30 (measured 2026-10-31).
 #
 # The draft needs the XHToken llama.cpp fork: the released Spark-X2.6-4B-DSpark.gguf
 # stores a per-head attn_gate instead of attn_q_norm/attn_k_norm, and the only loader
@@ -11,9 +16,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BIN=${BIN:-/data/llama.cpp-xhtoken/build/bin/llama-server}
-MODEL=${MODEL:-$ROOT/models/spark26-4b-Q6_K.gguf}
+MODEL=${MODEL:-$ROOT/models/instruct/Spark-X2.6-4B-Q4_K_M.gguf}
 DRAFT=${DRAFT:-$ROOT/models/dspark/Spark-X2.6-4B-DSpark.gguf}
-ALIAS=${ALIAS:-spark-dspark}
+ALIAS=${ALIAS:-spark-q4km-dspark}
 CTX=${CTX:-131072}
 PORT=${PORT:-8090}
 KV=${KV:-q8_0}          # f16 also fits: 10,876 MiB of 12,282, only 1,018 MiB free
