@@ -97,18 +97,49 @@ static int parse_header(const uint8_t * buf, size_t n, hdr_t * h) {
     return 0;
 }
 
-static int expected_payload(const hdr_t * h, size_t * out) {
-    const size_t nidx = (size_t) h->rows * h->cols / h->dim;
-    int bits = 1;
-    while ((1u << bits) < h->nc) bits++;
+static int v3_bits(int nc) { int b = 1; while ((1 << b) < nc) b++; return b < 1 ? 1 : b; }
+
+static size_t v2_stage_bytes(int rows, int cols, int dim, int nc) {
+    const size_t nidx = (size_t) rows * cols / dim;
+    int bits = v3_bits(nc);
     const size_t idx = (bits == 8) ? nidx : (nidx * (size_t) bits + 7) / 8 + 1;
-    *out = (size_t) h->stages * (16 + (size_t) h->nc * h->dim * 2 + (size_t) h->rows * 2 + idx);
+    return 16 + (size_t) nc * dim * 2 + (size_t) rows * 2 + idx;
+}
+
+/* DQV3: 20-byte header, main stream 12 bits per index starting at a byte
+ * boundary every row, and for widths above 12 a 1-bit plane per row
+ * (ds41_vq_row.cuh:7-20, :122-137). */
+static size_t v3_stage_bytes(int rows, int cols, int dim, int nc) {
+    const size_t nidx_row = (size_t) cols / dim;
+    const int bits = v3_bits(nc);
+    const int mb = bits > 12 ? 12 : bits;
+    const size_t mrow = (nidx_row * (size_t) mb + 7) / 8;
+    const size_t prow = bits > 12 ? (nidx_row + 7) / 8 : 0;
+    return 24 + (size_t) nc * dim * 2 + (size_t) rows * 2 + (size_t) rows * mrow + (size_t) rows * prow;
+}
+
+static size_t stage_bytes_for(int rows, int cols, int dim, int nc, const uint8_t * payload) {
+    return memcmp(payload, "DQV3", 4) ? v2_stage_bytes(rows, cols, dim, nc)
+                                      : v3_stage_bytes(rows, cols, dim, nc);
+}
+
+static int expected_payload(const hdr_t * h, size_t * out) {
+    (void) h;
+    *out = 0;
     return 0;
 }
 
-/* Decode one DQVQ payload and add it into out[rows*cols]. */
+static uint32_t rd_main12(const uint8_t * base, size_t i) {
+    const size_t bit = i * 12;
+    const uint8_t * q = base + (bit >> 3);
+    const uint32_t w = (uint32_t) q[0] | ((uint32_t) q[1] << 8) | ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24);
+    return (w >> (bit & 7)) & 0xFFFu;
+}
+
+/* Decode one stage payload, DQVQ (v2) or DQV3 (row-local 12-bit + plane). */
 static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint32_t * cols_o) {
-    if (memcmp(p, "DQVQ", 4)) return -1;
+    const int v3 = !memcmp(p, "DQV3", 4);
+    if (!v3 && memcmp(p, "DQVQ", 4)) return -1;
     uint16_t dim, nc;
     uint32_t rows, cols;
     memcpy(&dim, p + 4, 2);
@@ -118,7 +149,7 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
     *rows_o = rows;
     *cols_o = cols;
 
-    const uint8_t * q = p + 16;
+    const uint8_t * q = p + (v3 ? 24 : 16);
     float * C = malloc((size_t) nc * dim * 4);
     float * gr = malloc((size_t) rows * 4);
     if (!C || !gr) { free(C); free(gr); return -1; }
@@ -134,6 +165,30 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
         gr[r] = h2f(v);
     }
     q += (size_t) rows * 2;
+
+    if (v3) {
+        const int bits = v3_bits(nc);
+        const int mb = bits > 12 ? 12 : bits;
+        const size_t nidx_row = (size_t) cols / dim;
+        const size_t mrow = (nidx_row * (size_t) mb + 7) / 8;
+        const size_t prow = bits > 12 ? (nidx_row + 7) / 8 : 0;
+        const uint8_t * main = q;
+        const uint8_t * plane = q + (size_t) rows * mrow;
+        for (uint32_t r = 0; r < rows; r++) {
+            for (size_t i = 0; i < nidx_row; i++) {
+                uint32_t v = rd_main12(main + (size_t) r * mrow, i) & ((1u << mb) - 1u);
+                if (prow) v |= (uint32_t) ((plane[(size_t) r * prow + (i >> 3)] >> (i & 7)) & 1u) << 12;
+                if (v >= nc) { free(C); free(gr); return -1; }
+                const float g = gr[r];
+                const float * cb = C + (size_t) v * dim;
+                float * o = out + ((size_t) r * nidx_row + i) * dim;
+                for (uint16_t d = 0; d < dim; d++) o[d] += cb[d] * g;
+            }
+        }
+        free(C);
+        free(gr);
+        return 0;
+    }
 
     const size_t nidx = (size_t) rows * cols / dim;
     int bits = 1;
@@ -165,8 +220,13 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
 
 static int decode_all(const uint8_t * buf, size_t n, hdr_t * h, float ** out_w) {
     if (parse_header(buf, n, h)) return -1;
-    size_t want = 0;
-    expected_payload(h, &want);
+    const size_t per = (size_t) h->payload / h->stages;
+    const size_t want = stage_bytes_for((int) h->rows, (int) h->cols, h->dim, h->nc, buf + 32) * h->stages;
+    if (per * h->stages != (size_t) h->payload) {
+        fprintf(stderr, "payload %llu does not split into %u stages\n",
+                (unsigned long long) h->payload, h->stages);
+        return -1;
+    }
     if (want != (size_t) h->payload) {
         fprintf(stderr, "payload mismatch: header says %llu, layout implies %zu\n",
                 (unsigned long long) h->payload, want);
@@ -181,7 +241,6 @@ static int decode_all(const uint8_t * buf, size_t n, hdr_t * h, float ** out_w) 
     float * W = calloc(nw, 4);
     if (!W) return -1;
 
-    const size_t per = want / h->stages;
     for (uint16_t s = 0; s < h->stages; s++) {
         uint32_t r = 0, c = 0;
         if (decode_stage(buf + 32 + per * s, W, &r, &c) || r != h->rows || c != h->cols) {
@@ -200,19 +259,23 @@ static int cmd_info(const char * path) {
     if (!buf) { fprintf(stderr, "cannot read %s\n", path); return 1; }
     hdr_t h;
     if (parse_header(buf, n, &h)) { fprintf(stderr, "%s: not an RQVQ container\n", path); return 1; }
-    size_t want = 0;
-    expected_payload(&h, &want);
+    const int v3 = !memcmp(buf + 32, "DQV3", 4);
+    const size_t per = stage_bytes_for((int) h.rows, (int) h.cols, h.dim, h.nc, buf + 32);
+    const size_t want = per * h.stages;
 
-    const size_t nidx = (size_t) h.rows * h.cols / h.dim;
-    int bits = 1;
-    while ((1u << bits) < h.nc) bits++;
-    const size_t idxbytes = (bits == 8) ? nidx : (nidx * (size_t) bits + 7) / 8 + 1;
+    const size_t nidx_row = (size_t) h.rows ? (size_t) h.cols / h.dim : 0;
+    const int bits = v3_bits(h.nc);
+    const int mb = bits > 12 ? 12 : bits;
+    const size_t idxbytes = (v3 ? (size_t) h.rows * ((nidx_row * (size_t) mb + 7) / 8)
+                                : (bits == 8 ? (size_t) h.rows * nidx_row
+                                             : ((size_t) h.rows * nidx_row * (size_t) bits + 7) / 8 + 1));
 
     printf("file        %s\n", path);
     printf("bytes       %zu (%.4f GB)\n", n, (double) n / 1e9);
+    printf("format      %s (%s)\n", v3 ? "DQV3" : "DQVQ", v3 ? "row-local 12-bit + plane" : "global bitstream");
     printf("shape       %u x %u, %zu weights\n", h.rows, h.cols, (size_t) h.rows * h.cols);
     printf("per stage   dim %u, nc %u (%d-bit index), %zu bytes\n",
-           h.dim, h.nc, bits, want / h.stages);
+           h.dim, h.nc, bits, per);
     printf("stages      %u, payload %llu, total %zu\n",
            h.stages, (unsigned long long) h.payload, 32 + want);
     printf("bits/weight %.4f\n", n * 8.0 / ((double) h.rows * h.cols));

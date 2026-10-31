@@ -7,9 +7,7 @@ models/instruct/*.gguf
 models/vq-build*/
 
 # build scratch
-out/build/
-out/*.f32
-out/vq-*/
+out/
 models/server.log
 models/server-*.log
 
@@ -20,3 +18,6 @@ graphify-out/
 bin/
 .build/
 vendor/
+
+# cargo build output
+tools/target/

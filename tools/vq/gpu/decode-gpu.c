@@ -22,9 +22,10 @@
 #include <cuda_runtime.h>
 
 extern const char * vqg_decode_error(void);
-extern int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, float * out, int iters, double * ms);
-extern int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, const float * x, float * y, int variant, int iters, double * ms);
+extern int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3, float * out, int iters, double * ms);
+extern int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * x, float * y, int variant, int iters, double * ms);
 extern int vqg_gemv_f32(const float * w, const float * x, float * y, int rows, int cols, int iters, double * ms);
+extern int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * xT, int ntok, float * y, int iters, double * ms);
 
 static uint8_t * slurp(const char * path, size_t * out_n) {
     FILE * f = fopen(path, "rb");
@@ -50,17 +51,19 @@ static int cuda_ok(cudaError_t e, const char * what) {
 /* Benchmark every matrix listed in <dir>/manifest.txt and report the decode
  * rate of the whole artifact: container bytes per second, and the modeled
  * tokens per second of the fused path (one pass over all weights per token). */
-static int cmd_manifest(const char * dir, int iters) {
+static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long kvcache_bytes, int csv_only) {
     char mpath[1024];
     snprintf(mpath, sizeof mpath, "%s/manifest.txt", dir);
     FILE * mf = fopen(mpath, "r");
     if (!mf) { fprintf(stderr, "cannot read %s\n", mpath); return 1; }
 
-    double fused_ms = 0.0, dequant_ms = 0.0;
+    double fused_ms = 0.0, dequant_ms = 0.0, prefill_ms = 0.0;
     size_t bytes = 0, weights = 0;
     int tensors = 0;
     float * scratch = NULL;
     size_t scratch_bytes = 0;
+    float * xT = NULL, * yT = NULL;
+    size_t xT_cap = 0, yT_cap = 0;
 
     struct { char name[96]; double ms; } slow[5];
     for (int i = 0; i < 5; i++) { slow[i].name[0] = 0; slow[i].ms = -1; }
@@ -97,6 +100,7 @@ static int cmd_manifest(const char * dir, int iters) {
             free(buf); fclose(mf); return 1;
         }
 
+        const int v3 = !memcmp(buf + 32, "DQV3", 4);
         const size_t per = payload / stages;
         const size_t aper = (per + 7) & ~(size_t) 7;
         const size_t dbuf_bytes = 32 + aper * stages + 8;
@@ -122,7 +126,7 @@ static int cmd_manifest(const char * dir, int iters) {
         double f = 0.0, d = 0.0;
         for (uint16_t s = 0; s < stages; s++) {
             double ms = 0.0;
-            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, dx, dy, 2, iters, &ms)) {
+            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, 2, iters, &ms)) {
                 fprintf(stderr, "%s: %s\n", path, vqg_decode_error());
                 free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
                 return 1;
@@ -142,7 +146,7 @@ static int cmd_manifest(const char * dir, int iters) {
             }
             cudaMemset(scratch, 0, need);
             double ms = 0.0;
-            if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, scratch, iters, &ms)) {
+            if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, scratch, iters, &ms)) {
                 fprintf(stderr, "%s: %s\n", path, vqg_decode_error());
                 free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
                 return 1;
@@ -152,6 +156,44 @@ static int cmd_manifest(const char * dir, int iters) {
 
         fused_ms += f;
         dequant_ms += d;
+
+        if (prefill_tok > 0) {
+            const size_t needx = (size_t) cols * (size_t) prefill_tok;
+            if (needx > xT_cap) {
+                if (xT) cudaFree(xT);
+                float * host = malloc(needx * 4);
+                for (size_t i = 0; i < needx; i++) host[i] = sinf((float) i * 0.0001f);
+                if (cudaMalloc((void **) &xT, needx * 4) != cudaSuccess ||
+                    cudaMemcpy(xT, host, needx * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    fprintf(stderr, "%s: cudaMalloc prefill x failed\n", path);
+                    free(host); free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
+                    return 1;
+                }
+                free(host);
+                xT_cap = needx;
+            }
+            const size_t needy = (size_t) rows * (size_t) prefill_tok;
+            if (needy > yT_cap) {
+                if (yT) cudaFree(yT);
+                if (cudaMalloc((void **) &yT, needy * 4) != cudaSuccess) {
+                    fprintf(stderr, "%s: cudaMalloc prefill y failed\n", path);
+                    free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
+                    return 1;
+                }
+                yT_cap = needy;
+            }
+            cudaMemset(yT, 0, needy * 4);
+            for (uint16_t s = 0; s < stages; s++) {
+                double ms = 0.0;
+                if (vqg_prefill(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3,
+                                xT, prefill_tok, yT, iters, &ms)) {
+                    fprintf(stderr, "%s: prefill: %s\n", path, vqg_decode_error());
+                    free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
+                    return 1;
+                }
+                prefill_ms += ms;
+            }
+        }
         bytes += n;
         weights += (size_t) rows * cols;
         tensors++;
@@ -175,6 +217,22 @@ static int cmd_manifest(const char * dir, int iters) {
 
     if (!tensors) { fprintf(stderr, "%s: no matrices\n", mpath); return 1; }
     if (scratch) cudaFree(scratch);
+    if (xT) cudaFree(xT);
+    if (yT) cudaFree(yT);
+
+    /* ds4-bench column set, so a run here can be compared with ds4-perf tooling:
+     * ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,first_token_sec,
+     * kvcache_bytes. prefill is the weight path only; kvcache_bytes is geometry. */
+    if (csv_only) {
+        if (prefill_tok <= 0) { fprintf(stderr, "--csv needs --prefill N\n"); return 2; }
+        printf("ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,first_token_sec,kvcache_bytes\n");
+        printf("%d,%d,%.1f,%d,%.1f,%.4f,%lld\n",
+               prefill_tok, prefill_tok,
+               (double) prefill_tok * 1000.0 / prefill_ms,
+               1, 1000.0 / fused_ms,
+               prefill_ms / 1000.0, kvcache_bytes);
+        return 0;
+    }
 
     printf("artifact    %s\n", dir);
     printf("tensors     %d matrices, %zu weights\n", tensors, weights);
@@ -185,6 +243,13 @@ static int cmd_manifest(const char * dir, int iters) {
     printf("dequant     %.3f ms, %.2f GB/s of container\n",
            dequant_ms, (double) bytes / 1e9 / (dequant_ms * 1e-3));
     printf("decode rate %.1f tok/s (matrices only, batch 1)\n", 1000.0 / fused_ms);
+    if (prefill_tok > 0) {
+        printf("prefill     %d tokens in %.3f ms, %.1f tok/s, %.2f GB/s of container\n",
+               prefill_tok, prefill_ms,
+               (double) prefill_tok * 1000.0 / prefill_ms,
+               (double) bytes / 1e9 / (prefill_ms * 1e-3));
+        printf("first token %.1f ms (prefill only)\n", prefill_ms);
+    }
     printf("slowest     ");
     for (int i = 0; i < 5 && slow[i].ms >= 0; i++)
         printf("%s %.3f ms%s", slow[i].name, slow[i].ms, i < 4 && slow[i + 1].ms >= 0 ? ", " : "\n");
@@ -195,16 +260,41 @@ int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s <file.bin> [--iters N] [--check]\n"
-            "       %s --manifest <artifact-dir> [--iters N]\n", argv[0], argv[0]);
+            "       %s --manifest <artifact-dir> [--iters N] [--prefill N] [--csv]\n"
+            "              [--ctx N] [--kv f16|q8_0] [--kvcache-bytes N]\n"
+            "              [--layers N --full-layers N --kv-heads N --head-dim N]\n",
+            argv[0], argv[0]);
         return 2;
     }
-    int iters = 20, check = 0;
+    int iters = 20, check = 0, prefill_tok = 0, csv_only = 0;
+    int ctx = 131072, layers = 36, full_layers = 9, kv_heads = 4, head_dim = 256;
+    int kv_q8 = 1;
+    long long kvb_override = -1;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
+        else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) prefill_tok = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--csv")) csv_only = 1;
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv") && i + 1 < argc) kv_q8 = !strcmp(argv[++i], "q8_0");
+        else if (!strcmp(argv[i], "--kvcache-bytes") && i + 1 < argc) kvb_override = atoll(argv[++i]);
+        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--full-layers") && i + 1 < argc) full_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-heads") && i + 1 < argc) kv_heads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--head-dim") && i + 1 < argc) head_dim = atoi(argv[++i]);
     }
     if (iters < 1) iters = 1;
-    if (!strcmp(argv[1], "--manifest")) return cmd_manifest(argv[2], iters);
+
+    /* KV bytes for one sequence, the same arithmetic bin/plan uses: full layers
+     * hold ctx tokens, sliding layers hold their window. q8_0 costs 34 bytes per
+     * 32 values. Defaults are the Spark geometry (config.json). */
+    long long kvcache_bytes = kvb_override;
+    if (kvcache_bytes < 0) {
+        const double elem = kv_q8 ? 34.0 / 32.0 : 2.0;
+        kvcache_bytes = (long long) ((double) ctx * (double) full_layers * 2.0 * kv_heads * head_dim * elem
+                                   + 512.0 * (double) (layers - full_layers) * 2.0 * kv_heads * head_dim * elem);
+    }
+    if (!strcmp(argv[1], "--manifest")) return cmd_manifest(argv[2], iters, prefill_tok, kvcache_bytes, csv_only);
 
     size_t n = 0;
     uint8_t * buf = slurp(argv[1], &n);
@@ -224,6 +314,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s: header and file size disagree\n", argv[1]);
         return 1;
     }
+    const int v3 = !memcmp(buf + 32, "DQV3", 4);
     const size_t per = payload / stages;
     if (per * stages != payload) { fprintf(stderr, "payload does not split into %u stages\n", stages); return 1; }
 
@@ -257,7 +348,7 @@ int main(int argc, char ** argv) {
         if (cuda_ok(cudaMemset(dy, 0, (size_t) rows * 4), "zero y")) return 1;
         for (uint16_t s = 0; s < stages; s++) {
             double ms = 0.0;
-            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, dx, dy, variant, iters, &ms)) {
+            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, variant, iters, &ms)) {
                 fprintf(stderr, "stage %u gemv (variant %d): %s\n", s, variant, vqg_decode_error());
                 return 1;
             }
@@ -272,7 +363,7 @@ int main(int argc, char ** argv) {
     double dequant_ms = 0.0;
     for (uint16_t s = 0; s < stages; s++) {
         double ms = 0.0;
-        if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, dw, iters, &ms)) {
+        if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dw, iters, &ms)) {
             fprintf(stderr, "stage %u dequant: %s\n", s, vqg_decode_error());
             return 1;
         }
@@ -284,7 +375,7 @@ int main(int argc, char ** argv) {
     if (cuda_ok(cudaMemset(dw, 0, (size_t) rows * cols * 4), "zero w")) return 1;
     for (uint16_t s = 0; s < stages; s++) {
         double ms = 0.0;
-        if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, dw, 1, &ms)) {
+        if (vqg_dequant(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dw, 1, &ms)) {
             fprintf(stderr, "stage %u final dequant: %s\n", s, vqg_decode_error());
             return 1;
         }
@@ -302,7 +393,7 @@ int main(int argc, char ** argv) {
     if (cuda_ok(cudaMemset(dy, 0, (size_t) rows * 4), "zero y")) return 1;
     for (uint16_t s = 0; s < stages; s++) {
         double ms = 0.0;
-        if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, dx, dy, 2, 1, &ms)) {
+        if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, 2, 1, &ms)) {
             fprintf(stderr, "stage %u final gemv: %s\n", s, vqg_decode_error());
             return 1;
         }

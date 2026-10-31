@@ -42,14 +42,18 @@ echo "built $ROOT/bin/build-vq"
 $CC $CFLAGS -ffp-contract=off $VQ_INC -o "$ROOT/bin/decode" "$ROOT/tools/vq/decode.c" -lm
 echo "built $ROOT/bin/decode"
 
-# Rust decoder and decode bench: same container, same semantics, no crates.
-RUSTC=${RUSTC:-rustc}
-if command -v "$RUSTC" >/dev/null 2>&1; then
-  "$RUSTC" -O -C target-cpu=native -o "$ROOT/bin/dqvq" "$ROOT/tools/vq/decode-rs/decode.rs"
-  echo "built $ROOT/bin/dqvq"
-else
-  echo "skipped dqvq: $RUSTC not found"
+# Rust tools: one cargo workspace, as ds4-dfm-rs is laid out. The canonical
+# toolchain is a prerequisite, not an option: a build without cargo is an error,
+# never a silently missing binary.
+CARGO=${CARGO:-cargo}
+if ! command -v "$CARGO" >/dev/null 2>&1; then
+  echo "error: cargo not found; install the Rust toolchain from https://rustup.rs" >&2
+  exit 1
 fi
+"$CARGO" build --release --manifest-path "$ROOT/tools/Cargo.toml"
+cp "$ROOT/tools/target/release/dqvq" "$ROOT/bin/dqvq"
+cp "$ROOT/tools/target/release/vq-bench" "$ROOT/bin/vq-bench"
+echo "built $ROOT/bin/dqvq and $ROOT/bin/vq-bench"
 
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
@@ -73,5 +77,5 @@ if [ -x "$NVCC" ]; then
     -Wl,-rpath,/usr/local/cuda/lib64
   echo "built $ROOT/bin/decode-gpu"
 else
-  echo "skipped build-vq-gpu: $NVCC not found"
+  echo "skipped build-vq-gpu and decode-gpu: $NVCC not found"
 fi

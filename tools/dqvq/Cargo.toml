@@ -1,0 +1,10 @@
+[package]
+name = "dqvq"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reference decoder and fused GEMV for RQVQ VQ containers"
+
+[[bin]]
+name = "dqvq"
+path = "src/main.rs"

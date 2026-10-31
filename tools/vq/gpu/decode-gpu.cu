@@ -31,21 +31,26 @@ static int fail(const char * what, cudaError_t e) {
  * the host; nothing here may dereference `payload` on the host, because it is a
  * device pointer. */
 struct layout {
-    int dim, nc, rows, cols, nbit;
+    int dim, nc, rows, cols, nbit, v3;
     unsigned mask;
     size_t cb_off, gain_off, stream_off, nidx;
+    size_t mrow, prow;   /* DQV3: bytes per row of the 12-bit main stream and of the plane */
 };
 
-static layout make_layout(int dim, int nc, int rows, int cols) {
+static layout make_layout(int dim, int nc, int rows, int cols, int v3) {
     layout L;
-    L.dim = dim; L.nc = nc; L.rows = rows; L.cols = cols;
+    L.dim = dim; L.nc = nc; L.rows = rows; L.cols = cols; L.v3 = v3;
     L.nbit = 1;
     while ((1u << L.nbit) < (unsigned) nc) L.nbit++;
     L.mask = (1u << L.nbit) - 1u;
-    L.cb_off = 16;
-    L.gain_off = 16 + (size_t) nc * dim * 2;
+    const size_t nidx_row = (size_t) cols / dim;
+    const int mb = L.nbit > 12 ? 12 : L.nbit;
+    L.cb_off = v3 ? 24 : 16;
+    L.gain_off = L.cb_off + (size_t) nc * dim * 2;
     L.stream_off = L.gain_off + (size_t) rows * 2;
     L.nidx = (size_t) rows * cols / dim;
+    L.mrow = v3 ? (nidx_row * (size_t) mb + 7) / 8 : 0;
+    L.prow = (v3 && L.nbit > 12) ? (nidx_row + 7) / 8 : 0;
     return L;
 }
 
@@ -58,6 +63,23 @@ __device__ __forceinline__ uint32_t rd_idx(const uint8_t * s, size_t i, int nbit
     return (w >> (bit & 7)) & mask;
 }
 
+/* Format-aware index read: DQVQ numbers bits across the whole matrix, DQV3
+ * restarts the 12-bit stream at every row and carries the 13th bit in a plane
+ * (ds41_vq_row.cuh:7-20, :122-137). */
+__device__ __forceinline__ uint32_t rd_idx_fmt(const uint8_t * st, const layout & L, size_t r, size_t i) {
+    if (!L.v3) return rd_idx(st, r * (size_t) (L.cols / L.dim) + i, L.nbit, L.mask);
+    const uint8_t * base = st + r * L.mrow;
+    const size_t bit = i * 12;
+    const uint8_t * q = base + (bit >> 3);
+    const uint32_t w = (uint32_t) q[0] | ((uint32_t) q[1] << 8) | ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24);
+    uint32_t v = (w >> (bit & 7)) & 0xFFFu;
+    if (L.prow) {
+        const uint8_t * pl = st + L.mrow * (size_t) L.rows + r * L.prow;
+        v |= (uint32_t) ((pl[i >> 3] >> (i & 7)) & 1u) << 12;
+    }
+    return v;
+}
+
 /* One thread per group of `dim` columns: write the dequantised values. */
 __global__ void dequant_kernel(const uint8_t * p, const layout L, float * out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,7 +87,8 @@ __global__ void dequant_kernel(const uint8_t * p, const layout L, float * out) {
     const __half * cb = (const __half *) (p + L.cb_off);
     const __half * gr = (const __half *) (p + L.gain_off);
     const uint8_t * st = p + L.stream_off;
-    const uint32_t v = rd_idx(st, i, L.nbit, L.mask);
+    const uint32_t v = rd_idx_fmt(st, L, (i * (size_t) L.dim) / (size_t) L.cols,
+                                  i - ((i * (size_t) L.dim) / (size_t) L.cols) * (size_t) (L.cols / L.dim));
     const size_t r = (i * (size_t) L.dim) / (size_t) L.cols;
     const float g = __half2float(gr[r]);
     const __half * c = cb + (size_t) v * L.dim;
@@ -105,11 +128,7 @@ __global__ void gemv_warp4_kernel(const uint8_t * p, const layout L, const float
     for (; i + 32 * (GEMV_UNROLL - 1) < nidx_row; i += 32 * GEMV_UNROLL) {
         for (int k = 0; k < GEMV_UNROLL; k++) {
             const int ii = i + k * 32;
-            const size_t bit = (size_t) (r * nidx_row + ii) * L.nbit;
-            const uint32_t w = (uint32_t) st[bit >> 3]
-                             | ((uint32_t) st[(bit >> 3) + 1] << 8)
-                             | ((uint32_t) st[(bit >> 3) + 2] << 16);
-            const uint32_t v = (w >> (bit & 7)) & L.mask;
+            const uint32_t v = rd_idx_fmt(st, L, r, ii);
             const uint2 c = __ldg(cb + v);
             const float4 xv = x4[ii];
             const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&c.x));
@@ -118,11 +137,7 @@ __global__ void gemv_warp4_kernel(const uint8_t * p, const layout L, const float
         }
     }
     for (; i < nidx_row; i += 32) {
-        const size_t bit = (size_t) (r * nidx_row + i) * L.nbit;
-        const uint32_t w = (uint32_t) st[bit >> 3]
-                         | ((uint32_t) st[(bit >> 3) + 1] << 8)
-                         | ((uint32_t) st[(bit >> 3) + 2] << 16);
-        const uint32_t v = (w >> (bit & 7)) & L.mask;
+        const uint32_t v = rd_idx_fmt(st, L, r, i);
         const uint2 c = __ldg(cb + v);
         const float4 xv = x4[i];
         const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&c.x));
@@ -131,6 +146,44 @@ __global__ void gemv_warp4_kernel(const uint8_t * p, const layout L, const float
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[r] += acc * __half2float(gr[r]);
+}
+
+/* Prefill: one thread per (row, token). The row's indices are staged in shared
+ * memory once by the block, then every thread walks them, reading the codebook
+ * (the same address across the block, so L1 broadcasts it) and its own token's
+ * activations. xT is [col][token], so the block's reads at a fixed (i, d) are
+ * consecutive addresses: one coalesced transaction per warp. There is no
+ * cross-thread reduction, because each thread owns one output element.
+ *
+ * The first version of this kernel indexed the activation buffer per row and
+ * uncoalesced the reads by 8 KB; it ran at 6 tok/s. This shape is what the ds4
+ * group kernel does with codeword-once-dot-per-token, transposed onto threads. */
+#define PRE_THREADS 256
+
+__global__ void gemm_prefill_kernel(const uint8_t * p, const layout L, const float * xT,
+                                    int ntok, float * y) {
+    extern __shared__ uint16_t sidx[];
+    const int r = blockIdx.x;
+    const int nidx_row = L.cols / L.dim;
+    const uint8_t * st = p + L.stream_off;
+
+    for (int i = threadIdx.x; i < nidx_row; i += blockDim.x)
+        sidx[i] = (uint16_t) rd_idx_fmt(st, L, r, i);
+    __syncthreads();
+
+    const int t = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= ntok) return;
+
+    const __half * cb = (const __half *) (p + L.cb_off);
+    const float * xt = xT + t;
+    float acc = 0.0f;
+    for (int i = 0; i < nidx_row; i++) {
+        const __half * c = cb + (size_t) sidx[i] * L.dim;
+        const float * xg = xt + (size_t) i * L.dim * ntok;
+        for (int d = 0; d < L.dim; d++) acc += __half2float(c[d]) * xg[(size_t) d * ntok];
+    }
+    const __half gh = ((const __half *) (p + L.gain_off))[r];
+    y[(size_t) t * L.rows + r] += acc * __half2float(gh);
 }
 
 /* One warp per row, no shared codebook: the 64 KB table stays in L1 and the
@@ -149,7 +202,7 @@ __global__ void gemv_warp_kernel(const uint8_t * p, const layout L, const float 
 
     float acc = 0.0f;
     for (int i = lane; i < nidx_row; i += 32) {
-        const uint32_t v = rd_idx(st, (size_t) r * nidx_row + i, L.nbit, L.mask);
+        const uint32_t v = rd_idx_fmt(st, L, r, i);
         const __half * c = cb + (size_t) v * L.dim;
         const float * xg = x + (size_t) i * L.dim;
         for (int d = 0; d < L.dim; d++) acc += __half2float(c[d]) * xg[d];
@@ -181,7 +234,7 @@ __global__ void gemv_kernel(const uint8_t * p, const layout L, const float * x, 
         if (r >= L.rows) break;
         float acc = 0.0f;
         for (int i = threadIdx.x; i < nidx_row; i += blockDim.x) {
-            const uint32_t v = rd_idx(st, (size_t) r * nidx_row + i, L.nbit, L.mask);
+            const uint32_t v = rd_idx_fmt(st, L, r, i);
             const __half * c = scb + (size_t) v * L.dim;
             const float * xg = x + (size_t) i * L.dim;
             for (int d = 0; d < L.dim; d++) acc += __half2float(c[d]) * xg[d];
@@ -218,9 +271,9 @@ extern "C" {
 
 /* Decode one stage into out (device pointer), then optionally time `iters`
  * repeated launches. Returns the elapsed milliseconds of the best iteration. */
-int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols,
+int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
                 float * out, int iters, double * ms) {
-    const layout L = make_layout(dim, nc, rows, cols);
+    const layout L = make_layout(dim, nc, rows, cols, v3);
     const int threads = 256;
     const int blocks = (int) ((L.nidx + threads - 1) / threads);
     cudaEvent_t a, b;
@@ -244,9 +297,9 @@ int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols,
 
 /* Fused gather+dot per stage, accumulated into y (device pointer, rows).
  * variant 0 = shared-memory codebook, 1 = warp per row with the table in L1. */
-int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols,
+int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
              const float * x, float * y, int variant, int iters, double * ms) {
-    const layout L = make_layout(dim, nc, rows, cols);
+    const layout L = make_layout(dim, nc, rows, cols, v3);
     const int threads = 256;
     const size_t smem = (variant == 0) ? (size_t) L.nc * L.dim * 2 : 0;
     const int blocks = (variant == 0)
@@ -266,6 +319,34 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols,
         else                   gemv_warp_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
         cudaEventRecord(b);
         if (cudaEventSynchronize(b) != cudaSuccess) return fail("gemv launch", cudaGetLastError());
+        float t = 0;
+        cudaEventElapsedTime(&t, a, b);
+        if (t < best) best = t;
+    }
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    *ms = best;
+    return 0;
+}
+
+/* Prefill one stage: xT is [cols][ntok], y is [ntok][rows], both device-side. */
+int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                const float * xT, int ntok, float * y, int iters, double * ms) {
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    const int smem = /* shared index staging */ (int) ((size_t) (cols / dim) * 2);
+    if (smem > 48 * 1024 &&
+        cudaFuncSetAttribute(gemm_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess)
+        return fail("prefill shared memory opt-in", cudaGetLastError());
+    const dim3 grid(L.rows, (ntok + PRE_THREADS - 1) / PRE_THREADS);
+    cudaEvent_t a, b;
+    if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess)
+        return fail("event create", cudaGetLastError());
+    float best = 1e30f;
+    for (int it = 0; it < iters; it++) {
+        cudaEventRecord(a);
+        gemm_prefill_kernel<<<grid, PRE_THREADS, smem>>>((const uint8_t *) payload, L, xT, ntok, y);
+        cudaEventRecord(b);
+        if (cudaEventSynchronize(b) != cudaSuccess) return fail("prefill launch", cudaGetLastError());
         float t = 0;
         cudaEventElapsedTime(&t, a, b);
         if (t < best) best = t;

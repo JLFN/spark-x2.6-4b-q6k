@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["dqvq", "vq-bench"]
+
+# The harness and the decoders are measurement code: build them once, run them
+# many times, and never let a debug build be mistaken for a timing run.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

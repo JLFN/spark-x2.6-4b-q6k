@@ -38,6 +38,78 @@ extern int vqg_train(const float * X, int nvec, int dim, int nc, int iters, floa
 extern int vqg_assign(const float * X, int nvec, int dim, const float * C, int nc, int * idx);
 extern const char * vqg_last_error(void);
 
+/* ---- DQV3 payload: row-local 12-bit main stream + 1-bit plane -------------
+ * Source of truth for the geometry: cuda/ds41_vq_row.cuh:7-20 and :122-137 in
+ * ds4-dfm-rs. The main stream is always 12 bits and starts at a byte boundary
+ * every row; widths above 12 carry the extra bit in a plane of
+ * ceil(nidx_row/8) bytes per row. That is what lets the decode kernel load a
+ * whole 128-byte line per warp instead of a 3-byte window per index.
+ *
+ * One deliberate deviation, named: the codebook stays f16 (2 B), not E4M3.
+ * ds4's v3 uses E4M3 because its codebook is trained for it; rounding our
+ * learned f16 codewords to 3 mantissa bits would cost about 3% per entry,
+ * which is a quality change, not a layout change. The layout is what this
+ * commit ports.
+ */
+static int v3_main_bits(int nc) { int b = 1; while ((1 << b) < nc) b++; return b < 1 ? 1 : b; }
+
+static size_t v3_stage_bytes(int rows, int cols, int dim, int nc) {
+    const size_t nidx_row = (size_t) cols / (size_t) dim;
+    const int bits = v3_main_bits(nc);
+    const int mb = bits > 12 ? 12 : bits;
+    const size_t mrow = (nidx_row * (size_t) mb + 7) / 8;
+    const size_t prow = bits > 12 ? (nidx_row + 7) / 8 : 0;
+    return 24 + (size_t) nc * (size_t) dim * 2 + (size_t) rows * 2
+           + (size_t) rows * mrow + (size_t) rows * prow;
+}
+
+static void put_bits(uint8_t * base, size_t bitpos, uint32_t v, int nbits) {
+    for (int k = 0; k < nbits; k++)
+        if ((v >> k) & 1u) base[(bitpos + (size_t) k) >> 3] |= (uint8_t) (1u << ((bitpos + (size_t) k) & 7));
+}
+
+static size_t v3_pack(const float * Cb, const int * idx, const float * gr,
+                      int rows, int cols, int dim, int nc, uint8_t * out) {
+    uint8_t * p = out;
+    memcpy(p, "DQV3", 4); p += 4;
+    const int bits = v3_main_bits(nc);
+    const uint16_t d16 = (uint16_t) dim, n16 = (uint16_t) nc;
+    const uint32_t r32 = (uint32_t) rows, c32 = (uint32_t) cols;
+    const uint32_t flags = bits > 12 ? 1u : 0u;
+    memcpy(p, &d16, 2); p += 2;
+    memcpy(p, &n16, 2); p += 2;
+    memcpy(p, &r32, 4); p += 4;
+    memcpy(p, &c32, 4); p += 4;
+    memcpy(p, &flags, 4); p += 4;
+    /* 4 pad bytes: the header is 24 so the f16 codebook lands 8-byte aligned,
+     * which is what the uint2 codebook load in the decode kernel requires. */
+    const uint32_t pad = 0;
+    memcpy(p, &pad, 4); p += 4;
+    for (int i = 0; i < nc * dim; i++) {
+        const uint16_t h = go1b_fp32_to_fp16(Cb[i]);
+        memcpy(p, &h, 2); p += 2;
+    }
+    for (int r = 0; r < rows; r++) {
+        const uint16_t h = go1b_fp32_to_fp16(gr[r]);
+        memcpy(p, &h, 2); p += 2;
+    }
+    const int mb = bits > 12 ? 12 : bits;
+    const size_t nidx_row = (size_t) cols / (size_t) dim;
+    const size_t mrow = (nidx_row * (size_t) mb + 7) / 8;
+    const size_t prow = bits > 12 ? (nidx_row + 7) / 8 : 0;
+    uint8_t * main = p;
+    uint8_t * plane = p + (size_t) rows * mrow;
+    memset(main, 0, (size_t) rows * (mrow + prow));
+    for (int r = 0; r < rows; r++) {
+        for (size_t i = 0; i < nidx_row; i++) {
+            const uint32_t v = (uint32_t) idx[(size_t) r * nidx_row + i];
+            put_bits(main + (size_t) r * mrow, i * (size_t) mb, v & ((1u << mb) - 1u), mb);
+            if (prow) put_bits(plane + (size_t) r * prow, i, (v >> 12) & 1u, 1);
+        }
+    }
+    return (size_t) (plane + (size_t) rows * prow - out);
+}
+
 #define MAXMATCH 16
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -51,7 +123,7 @@ static int match_any(const char * name, char ** pats, int n) {
 int main(int argc, char ** argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: %s <hf-dir> <out-dir> <dim> <nc> <stages> "
-                        "[--match S] [--skip S] [--no-embed]\n", argv[0]);
+                        "[--match S] [--skip S] [--no-embed] [--format v2|v3]\n", argv[0]);
         return 2;
     }
     const char * hf = argv[1], * out = argv[2];
@@ -61,10 +133,12 @@ int main(int argc, char ** argv) {
     char * match[MAXMATCH]; int nmatch = 0;
     char * skip[MAXMATCH];  int nskip = 0;
     int no_embed = 0;
+    int fmt_v3 = 1;   /* DQV3 row-local 12-bit + plane; --format v2 writes DQVQ */
     for (int i = 6; i < argc; i++) {
         if (!strcmp(argv[i], "--match") && i + 1 < argc && nmatch < MAXMATCH) match[nmatch++] = argv[++i];
         else if (!strcmp(argv[i], "--skip") && i + 1 < argc && nskip < MAXMATCH) skip[nskip++] = argv[++i];
         else if (!strcmp(argv[i], "--no-embed")) no_embed = 1;
+        else if (!strcmp(argv[i], "--format") && i + 1 < argc) fmt_v3 = !strcmp(argv[++i], "v3");
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
 
@@ -133,7 +207,8 @@ int main(int argc, char ** argv) {
         float * gr = malloc((size_t) rows * 4);
         for (uint32_t r = 0; r < rows; r++) gr[r] = 1.0f;
 
-        const size_t psz = vq_payload_bytes((int) rows, (int) cols, dim, nc);
+        const size_t psz = fmt_v3 ? v3_stage_bytes((int) rows, (int) cols, dim, nc)
+                                  : vq_payload_bytes((int) rows, (int) cols, dim, nc);
         uint8_t * buf = malloc(psz * (size_t) stages + 64);
 
         const double t0 = now_s();
@@ -161,7 +236,9 @@ int main(int argc, char ** argv) {
                 resid[k] -= C[(size_t) idx[v] * dim + (k % (size_t) dim)];
             }
 
-            const size_t wrote = vq_pack(C, idx, gr, (int) rows, (int) cols, dim, nc, buf + psz * (size_t) s);
+            const size_t wrote = fmt_v3
+                ? v3_pack(C, idx, gr, (int) rows, (int) cols, dim, nc, buf + psz * (size_t) s)
+                : vq_pack(C, idx, gr, (int) rows, (int) cols, dim, nc, buf + psz * (size_t) s);
             if (wrote != psz) { fprintf(stderr, "%s: pack %zu != %zu\n", E->name, wrote, psz); }
             free(sub); free(C);
         }

@@ -1,0 +1,11 @@
+[package]
+name = "vq-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Benchmark harness for RQVQ VQ artifacts: prefill, decode, dequant"
+build = "build.rs"
+
+[[bin]]
+name = "vq-bench"
+path = "src/main.rs"

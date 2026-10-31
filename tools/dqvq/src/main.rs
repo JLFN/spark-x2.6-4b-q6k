@@ -36,6 +36,7 @@ use std::time::Instant;
 
 const RQVQ: &[u8; 4] = b"RQVQ";
 const DQVQ: &[u8; 4] = b"DQVQ";
+const DQV3: &[u8; 4] = b"DQV3";
 
 #[inline]
 fn u16le(b: &[u8], o: usize) -> u16 {
@@ -89,6 +90,11 @@ struct Stage<'a> {
     rows: usize,
     cols: usize,
     nbit: u32,
+    /// DQV3 row-local stream: bytes of the 12-bit main stream and of the plane,
+    /// per row. Zero for DQVQ, whose bits run across the whole matrix.
+    v3: bool,
+    mrow: usize,
+    prow: usize,
     gains: &'a [u8],
     stream: &'a [u8],
     /// Codebook as f32, the form the hot loops use.
@@ -97,9 +103,11 @@ struct Stage<'a> {
 
 impl<'a> Stage<'a> {
     fn open(p: &'a [u8]) -> Result<Stage<'a>, String> {
-        if p.len() < 16 || &p[0..4] != DQVQ {
-            return Err("stage payload magic is not DQVQ".into());
+        let v3 = p.len() >= 4 && &p[0..4] == DQV3;
+        if p.len() < 16 || (!v3 && &p[0..4] != DQVQ) {
+            return Err("stage payload magic is neither DQVQ nor DQV3".into());
         }
+        let hdr = if v3 { 24 } else { 16 };
         let dim = u16le(p, 4) as usize;
         let nc = u16le(p, 6) as usize;
         let rows = u32le(p, 8) as usize;
@@ -109,25 +117,30 @@ impl<'a> Stage<'a> {
         }
         let cb_len = nc * dim * 2;
         let gain_len = rows * 2;
-        if p.len() < 16 + cb_len + gain_len {
+        if p.len() < hdr + cb_len + gain_len {
             return Err("stage payload is truncated".into());
         }
         let mut nbit = 1u32;
         while (1usize << nbit) < nc {
             nbit += 1;
         }
-        let nidx = rows * cols / dim;
-        let idx_bytes = if nbit == 8 {
-            nidx
+        let nidx_row = cols / dim;
+        let (mrow, prow, idx_bytes) = if v3 {
+            let mb = (nbit as usize).min(12);
+            let mrow = (nidx_row * mb + 7) / 8;
+            let prow = if nbit > 12 { (nidx_row + 7) / 8 } else { 0 };
+            (mrow, prow, rows * (mrow + prow))
         } else {
-            (nidx * nbit as usize + 7) / 8 + 1
+            let nidx = rows * nidx_row;
+            let idx = if nbit == 8 { nidx } else { (nidx * nbit as usize + 7) / 8 + 1 };
+            (0, 0, idx)
         };
-        if p.len() < 16 + cb_len + gain_len + idx_bytes {
+        if p.len() < hdr + cb_len + gain_len + idx_bytes {
             return Err("stage index stream is truncated".into());
         }
-        let cb = &p[16..16 + cb_len];
-        let gains = &p[16 + cb_len..16 + cb_len + gain_len];
-        let stream = &p[16 + cb_len + gain_len..];
+        let cb = &p[hdr..hdr + cb_len];
+        let gains = &p[hdr + cb_len..hdr + cb_len + gain_len];
+        let stream = &p[hdr + cb_len + gain_len..];
 
         let mut cb32 = Vec::with_capacity(nc * dim);
         for i in 0..nc * dim {
@@ -139,14 +152,35 @@ impl<'a> Stage<'a> {
             rows,
             cols,
             nbit,
+            v3,
+            mrow,
+            prow,
             gains,
             stream,
             cb32,
         })
     }
 
+    /// Index of the `i`th group in `row`. DQVQ numbers bits across the matrix;
+    /// DQV3 restarts at every row and takes the 13th bit from the plane
+    /// (ds41_vq_row.cuh:7-20, :122-137).
     #[inline]
-    fn index(&self, gi: usize) -> u32 {
+    fn index(&self, row: usize, i: usize) -> u32 {
+        if self.v3 {
+            let nidx_row = self.cols / self.dim;
+            let bit = i * 12;
+            let q = row * self.mrow + (bit >> 3);
+            let byte = |k: usize| self.stream.get(q + k).copied().unwrap_or(0) as u32;
+            let w = byte(0) | byte(1) << 8 | byte(2) << 16 | byte(3) << 24;
+            let mut v = (w >> (bit & 7)) & 0xfff;
+            if self.prow > 0 {
+                let p = self.mrow * self.rows + row * self.prow + (i >> 3);
+                v |= (u32::from(self.stream.get(p).copied().unwrap_or(0)) >> (i & 7) & 1) << 12;
+            }
+            let _ = nidx_row;
+            return v;
+        }
+        let gi = row * (self.cols / self.dim) + i;
         if self.nbit == 8 {
             return u32::from(self.stream[gi]);
         }
@@ -169,7 +203,7 @@ impl<'a> Stage<'a> {
             let g = self.gain(r);
             let base = r * self.cols;
             for i in 0..nidx_row {
-                let v = self.index(r * nidx_row + i) as usize;
+                let v = self.index(r, i) as usize;
                 let cb = &self.cb32[v * self.dim..v * self.dim + self.dim];
                 let o = &mut out[base + i * self.dim..base + i * self.dim + self.dim];
                 for d in 0..self.dim {
@@ -186,7 +220,7 @@ impl<'a> Stage<'a> {
         let g = self.gain(r);
         let mut s = 0.0f32;
         for i in 0..nidx_row {
-            let v = self.index(r * nidx_row + i) as usize;
+            let v = self.index(r, i) as usize;
             let cb = &self.cb32[v * self.dim..v * self.dim + self.dim];
             for d in 0..self.dim {
                 s += cb[d] * x[i * self.dim + d];
@@ -221,13 +255,18 @@ fn open(buf: &[u8]) -> Result<Container<'_>, String> {
     while (1usize << nbit) < nc {
         nbit += 1;
     }
-    let nidx = rows * cols / dim;
-    let idx_bytes = if nbit == 8 {
-        nidx
+    let v3 = buf.len() >= 36 && &buf[32..36] == b"DQV3";
+    let nidx_row = cols / dim;
+    let per = if v3 {
+        let mb = (nbit as usize).min(12);
+        let mrow = (nidx_row * mb + 7) / 8;
+        let prow = if nbit > 12 { (nidx_row + 7) / 8 } else { 0 };
+        24 + nc * dim * 2 + rows * 2 + rows * (mrow + prow)
     } else {
-        (nidx * nbit as usize + 7) / 8 + 1
+        let nidx = rows * nidx_row;
+        let idx_bytes = if nbit == 8 { nidx } else { (nidx * nbit as usize + 7) / 8 + 1 };
+        16 + nc * dim * 2 + rows * 2 + idx_bytes
     };
-    let per = 16 + nc * dim * 2 + rows * 2 + idx_bytes;
     if payload != nstages * per {
         return Err(format!(
             "payload byte count says {payload}, layout implies {}",
