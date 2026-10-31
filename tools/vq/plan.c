@@ -83,8 +83,7 @@ static uint64_t tensor_bytes(const v41_st_ent * E, const enc_t * e) {
     return (rows * cols / (uint64_t) e->block) * (uint64_t) e->block_bytes;
 }
 
-static void print_row(const char * label, const row_t * r, int json_first) {
-    if (json_first) {
+static void print_row(const char * label, const row_t * r, int json_first) {    if (json_first) {
         printf("{\"encoding\": \"%s\", \"artifact_gb\": %.3f, \"bpw\": %.3f, "
                "\"weights_mib\": %.0f, \"kv_mib\": %.0f, \"buffers_mib\": %.0f, "
                "\"total_mib\": %.0f, \"headroom_mib\": %.0f, \"relL2\": %.4f}",
@@ -117,7 +116,27 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const char * dir = argv[1];
-    uint64_t ctx = 131072;
+    /* Default context is the checkpoint's own limit, read from config.json
+     * (max_position_embeddings). Spark-X2.6-4B declares 1,048,576; serving it at
+     * a smaller window is a VRAM choice, not a model limit. */
+    uint64_t ctx = 0;
+    {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/config.json", dir);
+        FILE * cf = fopen(path, "rb");
+        if (cf) {
+            char buf[65536];
+            size_t n = fread(buf, 1, sizeof buf - 1, cf);
+            buf[n] = 0;
+            fclose(cf);
+            const char * p = strstr(buf, "\"max_position_embeddings\"");
+            if (p) {
+                p = strchr(p, ':');
+                if (p) ctx = strtoull(p + 1, NULL, 10);
+            }
+        }
+    }
+    if (ctx == 0) ctx = 131072;   /* fallback when config.json is absent */
     int kv_q8 = 0, layers = 36, full_layers = 9, kv_heads = 4, head_dim = 256;
     double kv_bytes_per_token = 0.0;   /* >0 overrides the computed KV */
     int want_vq = 0, vq_dim = 4, vq_nc = 4096, vq_stages = 2, vq_embed = 0, json = 0;

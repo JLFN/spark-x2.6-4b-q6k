@@ -32,8 +32,14 @@ BF16.
 
     ./vendor/llama.cpp/build/bin/llama-server    # built by tools/runtime/build-runtime.sh
 
+The checkpoint declares a 1,048,576-token limit (config.json
+`max_position_embeddings`), and the GGUF keeps it. This repo serves a 131,072
+window because the GQA KV for the whole 1M does not fit the card: 19,613 MiB at
+q8_0 against 12,282 MiB total. 1M is a model limit, not a practical serving size
+here.
+
 open-grok already knows the model as `spark2.6-4b-q6k`
-(`http://127.0.0.1:8090/v1`, context 131072). Start the script first, then pick the
+(`http://127.0.0.1:8090/v1`, served at a 131,072 window). Start the script first, then pick the
 model in open-grok. This is a BASE checkpoint: it continues text rather than
 following instructions.
 

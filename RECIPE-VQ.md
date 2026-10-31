@@ -151,11 +151,22 @@ per-token figure.
     ./bin/plan models/hf --vq 4 4096 2 --vq-embed --kv-bytes 770 --ctx 131072
     # VQ 4x4096 x2   3.10 GB   2,960 weights  +  96 KV  + 1,300 buffers = 4,356 MiB
 
+The model's own limit is 1,048,576 tokens (config.json
+max_position_embeddings), so plan defaults to 1M and only serves a smaller window
+when told to. At 1M the GQA KV is the binding constraint on this card: 19,613 MiB
+at q8_0 and 36,919 MiB at f16, against 12,282 MiB total, so 1M does not fit at
+all with a GQA cache; 131,072 is what this repository actually serves.
+
 So in a runtime that packs its KV, the VQ build would sit at 4,356 MiB rather than
 6,737 MiB, and the KV term stops mattering. Two things follow. The weight saving
 from VQ stays at 335 MiB either way, so it does not become more attractive. And
 the KV saving is available to any Spark runtime that implements a packed KV,
 including one serving the existing Q6_K.
+
+At 1M the same packing changes the verdict on context: 10,368 B/token at a plain
+4-bit packing is about 10.4 GiB, still too large beside 2,960 MiB of weights, so
+only a latent scheme in A.X-K2's class (770 B/token, 807 MiB at 1M) would make the
+full window reachable, and Spark has no such compressor.
 
 ## 6. What a runnable VQ Spark still needs
 
