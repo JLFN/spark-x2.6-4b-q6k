@@ -17,6 +17,7 @@ context on a 12 GB card.
 | Decode, MEASURED | 84.9 tok/s (11.78 ms/token) at a 131072-token context allocation |
 | open-grok | registered as `spark2.6-4b-q6k`, `context_window = 131072` |
 | Quality gate | NOT RUN — perplexity and KL against the BF16 GGUF are the precondition for publishing |
+| DSpark pairing | WORKS on the XHToken fork, 1.30-1.40x decode on normal text at 128K (section 12) |
 | Hugging Face | not published; plan is section 8 |
 
 ## 1. Target host
@@ -213,3 +214,57 @@ the 0.25 partial rotary factor. No new kernels: Q6_K and Q8_0 already exist in
 1. Run the section 7 gate and record the numbers in `docs/`.
 2. Decide the publish target and visibility with the owner, then publish.
 3. Decide whether the Rust engine needs the port (section 9) at all.
+
+## 12. DSpark speculative decoding (2026-10-31)
+
+The draft is not a merge partner: `XHToken/Spark-X2.6-4B-DSpark-GGUF` is a 624 M
+parameter draft model for speculative decoding, 5 sliding-window layers, BF16,
+7 proposed tokens per pass, trained to read target hidden states at layers
+`[2, 10, 18, 25, 33]`. Pairing it with the Q6_K target is the legitimate
+"combination"; anything that merges weights would be a new model, not this one.
+
+Measured facts:
+
+| | |
+|---|---|
+| Draft artifact | `Spark-X2.6-4B-DSpark.gguf`, 1,254,293,824 B, sha256 `2ee073c1...eedeac8` (matches the Hub LFS hash) |
+| Draft architecture | `dflash` (per the GGUF metadata), context 1,048,576 declared |
+| Required toolchain | XHToken fork `/data/llama.cpp-xhtoken` @ `22c0ae1871b60123c5afc008a78fe9c6fffa2858` |
+| Upstream `fa3645feb` | FAILS: `check_tensor_dims: tensor 'blk.0.attn_q_norm.weight' not found` |
+| Fork build fix | `src/llama-context.cpp` needs `#include <algorithm>` (uses `std::all_of`) |
+| Load test | both models load, server answers on 127.0.0.1:8092 |
+
+Why upstream fails, with the evidence: the released draft stores `blk.0.attn_gate.weight`
+and no `attn_q_norm` (checked with `strings` on the GGUF). The fork's
+`src/models/dflash.cpp` at 22c0ae1 selects the layout with
+`has_attn_gate = ml->get_tensor_meta("blk.0.attn_gate.weight") != nullptr` and only
+then creates `attn_q_norm`/`attn_k_norm` in the else branch. The 10-25 upstream code
+has no such branch and demands both norms unconditionally.
+
+Measurements, greedy, 256-token continuations, three fixed prompts, same fork binary:
+
+| Context, KV | No draft | With draft | Acceptance | VRAM with draft |
+|---|---:|---:|---:|---:|
+| 32K, f16 | 98.7 / 96.2 / 95.9 | 139.0 / 132.0 tok/s | 0.23 / 0.23 | 7,343 MiB |
+| 128K, f16 | 98.1 / 94.7 / 94.6 | 123.0 / 125.4 tok/s | 0.20 / 0.23 | 10,876 MiB (1,018 free) |
+| 128K, q8_0 KV | — | 116.5 / 138.2 tok/s | 0.20 / 0.30 | 9,172 MiB (2,723 free) |
+
+The third prompt degenerates into repetition and reaches 0.96 acceptance and
+285-299 tok/s in every configuration. That is the honest picture: speculative
+decoding pays when the draft can predict the target, and this draft was trained
+against the post-trained Spark-X2.6-4B, not against this BASE checkpoint. The card
+reports a mean acceptance length of 4.0-5.2 (about 2x speed) on its intended target;
+here the mean length is 2.4-2.6 and the gain is 1.3-1.4x on normal text.
+
+Risks:
+
+- The draft and target are different checkpoints (post-trained draft, base target).
+  Function works; acceptance is the measured cost, not an assumption.
+- 128K with f16 KV leaves 1,018 MiB. Any other GPU job needs `KV=q8_0` or a smaller
+  `CTX`; q8_0 KV keeps 2,723 MiB free at the same context.
+- The fork is a third-party branch three days younger than the upstream pin, and it
+  is built with one local source fix. Treat it as a separate toolchain, not as
+  upstream.
+- No quality change is expected: the target verifies every accepted token. That is a
+  property of the algorithm, not a measurement made here.
+

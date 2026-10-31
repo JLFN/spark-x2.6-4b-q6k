@@ -1,6 +1,8 @@
 # artifacts and the source checkpoint live on disk, not in git
 models/*.gguf
 models/hf/
+models/dspark/*.gguf
+models/dspark/*.log
 
 # build scratch
 out/build/
