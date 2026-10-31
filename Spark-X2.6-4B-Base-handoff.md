@@ -1,102 +1,105 @@
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, remote
-https://github.com/JLFN/spark-x2.6-4b-q6k at aa10dcc, working tree clean.
+Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD 3c2fef3, working tree
+clean. Remote https://github.com/JLFN/spark-x2.6-4b-q6k is at f2978e1, so
+d22cce1 and 3c2fef3 are local-only until pushed.
 
-This session took the repository from a Q6_K build record to a working VQ
-toolchain, measured it, and wrote it down. Everything below was run and measured
-here; nothing is a plan dressed as a result.
+Everything below was run in this repository; nothing is a plan dressed as a
+result. Where a number is missing it says so.
 
 ## 1. Where things stand
 
-- Q6_K GGUF build: done, runs in llama.cpp, 3.46 GB, about 95-98 tok/s at 128K.
-- DSpark speculative decoding: done, pairs with the official Q4_K_M instruct
-  target, 1.13-1.40x decode, requires the XHToken fork.
-- VQ toolchain: built, CPU and GPU, converts the checkpoint in 22 s on the GPU.
-- VQ artifact: exists at models/vq-build-gpu (dim 4, 1024 codewords, 1 stage,
-  1.29 GB, 2.43 bpw, per-tensor relL2 19-25%).
-- VQ runtime: does not exist. Nothing decodes these containers yet.
+- Q6_K GGUF: runs in llama.cpp at 128K, 3.46 GB, 107 tok/s without the draft,
+  122-150 tok/s with DSpark.
+- VQ artifacts: 4x8192 x2 is the recommended one (3.375 GB, 6.5653 bpw,
+  whole-model relL2 3.568%); 4x4096 x2 (3.104 GB, 4.244%) and 4x4096 x3
+  (4.655 GB, 2.175%) are built too.
+- Decoders: C (bin/decode), Rust (bin/dqvq) and CUDA (bin/decode-gpu) all read
+  the container. C and Rust are bit-exact; CUDA matches a host f64 matvec.
+- Decode rate: 97.4 tok/s for matrix work at 4x8192 x2, 328.7 GB/s of container.
+- Prefill: NOT measured. Both kernel shapes tried today were wrong for a dense
+  model (see 3) and their numbers must not be quoted.
+- VQ runtime: still does not exist. Nothing but these tools decodes the format.
 
-## 2. What was measured (do not re-derive these)
+## 2. Measurements (do not re-derive)
 
-Per-tensor, model.layers.0.mlp.down_proj.weight (26.2 M weights):
+Quality, whole checkpoint, 4,111,892,480 weights, weighted relL2:
 
-| Encoding | bpw | relL2 |
-|---|---:|---:|
-| Q8_0 | 8.50 | 0.54% |
-| Q6_K | 6.56 | 1.79% |
-| Q5_K | 5.50 | 3.63% |
-| Q4_K | 4.50 | 7.17% |
-| VQ 4x4096 x2 | 6.02 | 3.93% |
-| VQ 4x2048 x2 | 5.51 | 4.88% |
-| Q3_K | 3.44 | 15.17% |
-| VQ 4x1024 x1 | 2.50 | 23.10% |
-| Q2_K | 2.63 | 29.76% |
+    Q5_K            3.06 GB   5.75 bpw   3.626%
+    VQ 4x4096 x2    3.10 GB   6.04 bpw   4.244%
+    VQ 4x8192 x2    3.38 GB   6.57 bpw   3.569%
+    Q6_K            3.46 GB   6.72 bpw   1.784%
+    VQ 4x4096 x3    4.66 GB   9.06 bpw   2.175%
 
-Conversion speed: GPU 0.2 s vs CPU 22.0 s for that matrix (about 110x); whole
-checkpoint 22.4 s on GPU against 858.5 s on 12 CPU workers. Quality identical to
-0.003 percentage points; the GPU is not byte-deterministic (FP64 atomics).
+Decode rate, batch 1, matrix work only, best of 5 (`decode-gpu --manifest`):
 
-VRAM, 128K, q8_0 KV, measured on the card: Q4_K_M 7,127 MiB alone, 8,817 with the
-draft; Q6_K 9,396 MiB at f16 KV. Planner predicts within 1.5-2.3%.
+    4x1024 x1    1.289 GB   5.064 ms/token   254.6 GB/s   197.5 tok/s
+    4x8192 x2    3.375 GB  10.266 ms/token   328.7 GB/s    97.4 tok/s
+    4x4096 x3    4.655 GB  16.196 ms/token   287.4 GB/s    61.7 tok/s
 
-Context: config.json declares 1,048,576, and the planner defaults to it. At 1M
-with a GQA cache the KV alone is 19,613 MiB at q8_0 (36,918 at f16), so 1M does
-not fit this card; the repo serves 131,072. DeepSeek V4.1 reaches 0.93 GB at 1M
-because its KV is a compressed latent carried by four source layers, which Spark
-does not have. VQ does not change any of this.
+DQV3 (row-local 12-bit + plane) gate on layer 0 down_proj, dim 4 / 8192 / 2:
 
-## 3. Decisions taken, with reasons
+    C decode vs checkpoint      3.282% relL2   (DQVQ build of the same rate: 3.277%)
+    Rust vs C dump              26,214,400 / 26,214,400 exact
+    CUDA fused vs host f64      maxabs 2e-6
 
-- VQ is not a size win here. At Q5_K-class error it saves 335 MiB against Q6_K,
-  and Q6_K is twice as accurate at nearly the same memory. Recorded in
-  RECIPE-VQ section 1; do not relitigate without new measurements.
-- The repo serves 131,072 because that is what fits, not because the model stops
-  there. Earlier text in this session got that wrong and was corrected.
-- The VQ path reads the HF checkpoint, never a GGUF. The tools read
-  models/hf directly through the vendored safetensors reader.
-- Everything needed to build is in-repo: YoungAi VQ headers, llama.cpp's
-  ggml-quants.c, the CUDA encoder. The only external inputs are the checkpoint,
-  the CUDA toolkit and (for runtimes) tool/runtime/build-runtime.sh fetching two
-  pinned llama.cpp commits into vendor/.
+DQV3 decode speed, same matrix: 0.0881 ms (243 GB/s) against 0.0717 ms for
+DQVQ (299 GB/s). The payload is in place; the kernel that exploits it is not.
+
+## 3. Decisions and why
+
+- VQ is not a size win at Q5_K quality on this model, and VQ at 6.57 bpw still
+  loses to Q6_K at 6.72. Q6_K is the artifact to serve; 4x8192 x2 is the VQ
+  pick when a VQ artifact is wanted.
+- The codebook stays f16 in DQV3. ds4's E4M3 would round our learned codewords
+  by about 3%, which is a quality change, not a layout change.
+- The Rust tools are a cargo workspace (tools/Cargo.toml). build.sh fails when
+  cargo is missing; there is no "skipped rustc" branch any more.
+- The prefill kernel was tried twice and abandoned, not tuned: the first
+  uncoalesced the activations by 8 KB (84 s for 512 tokens, 6 tok/s), the second
+  gave each thread one token and no reuse (494 ms for one token). A dense model
+  needs a tiled GEMM; ds4's fused prefill is MoE-shaped and does not transfer.
 
 ## 4. Open work, in priority order
 
-1. Calibration. The encoder already supports X-weighted assignment
-   (1/diag(H^-1), GPTQ-consistent) but build-vq-gpu passes NULL. Needed: a Spark
-   forward over a corpus that dumps per-tensor input activations, then a --stats
-   path. Reference pipeline: /data/ds4-dfm-rs/tools/vq_calib (collect_stats.py,
-   reduce_stats.py); Spark-relevant parts mapped in RECIPE-VQ section 6.
-2. A runtime that decodes the containers. Until then the only quality signal is
-   per-tensor relL2. Options: a loader that applies codebooks at load, or
-   converting to a format an existing runtime understands.
-3. Re-run the conversion at a rate that matters (4x4096, 2 stages) now that it
-   costs seconds rather than an hour, and decide with data.
-4. Optional: verification that decoding an RQVQ file reproduces the encoder's
-   reconstruction (eg2_vq proves this for its own payloads; build-vq does not
-   ship a checker yet).
+1. Warp block-load decode kernel. Three 128-byte lines per warp, 96 words in
+   registers, funnelshift per round, plane bit by one shuffle. Reference:
+   cuda/ds41_vq_row.cuh:122-137 and :200-220 in /data/ds4-dfm-rs. Gate: the
+   three checks above, then speed against 299 GB/s.
+2. Tiled prefill. Reference: cuda/ds41_vq_prefill_mma.cuh:1-40, 128 rows x
+   128 tokens x BK 64, bf16 products with f32 accumulate, codebook decoded into
+   shared. Gate: host matvec per token block, then prefill_tps.
+3. `vq-bench` prefill numbers are not usable until 2; the harness itself (ds4
+   CSV columns, compare) is fine.
+4. Nothing has been pushed since f2978e1.
 
-## 5. How to resume in one screen
+## 5. Resume
 
-    ./tools/vq/build.sh                     # builds all tools, CPU + GPU
-    ./bin/plan models/hf --vq 4 4096 2      # size and VRAM before converting
-    ./bin/build-vq-gpu models/hf models/vq-build-gpu 4 1024 1
-    ./bin/eg2_vq tensor models/hf model.layers.0.mlp.down_proj.weight 4 1024
-    ./bin/quant_err models/hf model.layers.0.mlp.down_proj.weight q6_K
-    ./models/run-spark26.sh                 # the GGUF server, port 8090
-    ./models/run-spark26-dspark.sh          # the DSpark pairing, port 8090
+    ./tools/vq/build.sh                       # C tools + cargo workspace
+    ./bin/decode info <file.bin>              # header, format, consistency
+    ./bin/decode check <file.bin> models/hf <tensor>
+    ./bin/decode dump <file.bin> <out.f32> && ./bin/dqvq check <file.bin> <out.f32>
+    ./bin/decode-gpu --manifest models/vq-build-8192-2 --iters 5
+    ./bin/decode-gpu <file.bin> --check
+    ./bin/vq-bench models/vq-build-8192-2 --iters 5 [--prefill N] [--csv]
+    ./bin/vq-bench compare a.csv b.csv
 
-AGENTS.md is the agent-facing version of this file: it has the commands, the
-verification snippet, the pitfall list and the same honesty about VQ's place.
+## 6. Traps
 
-## 6. Traps that already cost time
-
-- Two llama-server processes do not fit: 9-11 GB each. Kill by the pid on port
-  8090, and confirm with nvidia-smi before starting another.
-- `kill` did not stop one server; `kill -9` did. A stuck generation filled 72,012
-  tokens because the client sent no max_tokens.
-- Upstream llama.cpp cannot load the DSpark draft (attn_gate layout); only the
-  XHToken fork at 22c0ae1 can, plus an <algorithm> include fix under gcc 14.
-- The GPU encoder needs device pointers: pageableMemoryAccess is 0 on this card.
-- quantize into Q5_K/Q4_K artifacts exists locally (models/spark26-4b-Q{5,4}_K.gguf)
-  and is gitignored.
+- /tmp is a 16 GB tmpfs here. A VQ build written there dies mid-file, leaves a
+  truncated manifest and a plausible-looking aggregate. Build into out/ or
+  /data; build-vq-gpu now checks every malloc and write and removes the partial
+  file, but the tmpfs is still the wrong place.
+- Stage payloads are copied to an 8-byte-aligned device offset before the
+  kernels see them; the file packs them contiguously and the f16 codebook is
+  read as uint2/half2.
+- DQV3 header is 24 bytes on purpose (4 pad after flags). 20 put the codebook at
+  4 mod 8 and faulted the uint2 load.
+- rustc defaults to edition 2015; the crates are edition 2021 in
+  tools/Cargo.toml, and Cargo.toml sets lto and codegen-units for release.
+- ds4-core's Rust f16 decoder (crates/ds4-core/src/vq.rs, the e == 0 branch at
+  112) decodes subnormals one binade low; vq_fmt.h:22-28 and dqvq use 113.
+- Two llama-server instances do not fit on this card; one at 128K q8_0 plus the
+  draft is about 8.8 GB of 12.3 GB.
+- The Q6_K Base checkpoint loops under greedy chat decoding; that is the BASE
+  model, not damage. Send temperature 0.8-1.0 and always send max_tokens.
