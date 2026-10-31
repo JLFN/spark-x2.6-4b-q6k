@@ -1,8 +1,8 @@
 # Spark-X2.6-4B-Base — session handoff
 
 Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
-carries this handoff (docs(handoff): the tiled prefill in the model runtime),
-and origin/master is behind it until the push is approved. The working tree is
+carries this handoff (docs(handoff): the per-model kernel tuner), and
+origin/master is behind it until the push is approved. The working tree is
 clean once that commit exists.
 
 Everything below was run in this repository; nothing is a plan dressed as a
@@ -40,6 +40,12 @@ result. Where a number is missing it says so.
   tok/s at 128-512 tokens, 14x the token-by-token path, with the same
   generated ids and a relL2 of 0.0055% at 5 tokens and 0.15% at 600 against
   that path.
+- Kernel tuner: bin/vq-tune sweeps the legal GEMV variants, launch widths and
+  prefill tiles on one artifact's real payloads and writes
+  <artifact>/vq-tune.profile; the runtime reads it when the artifact
+  fingerprint and the device name match. On 4x8192 x2 the profile is
+  bit-identical to the heuristic and moves a 500-token prompt from 892.3 to
+  917.8 tok/s (section 2).
 
 ## 2. Measurements (do not re-derive)
 
@@ -170,6 +176,26 @@ dim 8 with 8192, and the DQVQ build of 8192):
     CUDA prefill vs host f64    relL2 0.0159%, maxabs 1.3e-3, tokens
                                 0/1/63/64/127/128/511, all five
 
+Kernel tuning, 2026-10-31, the whole 4x8192 x2 DQV3 artifact (bin/vq-tune,
+512-token tiles, 7 timed launches per candidate; 6 distinct geometries, not
+216 matrices):
+
+    131072x2560 embedding   1 matrix    decode 378.0 GB/s   prefill v1 256x64   22,083 tok/s
+    2560x10240 down        36           decode 328.1 GB/s   prefill v2  64x64  321,246 tok/s
+    10240x2560 gate/up     72           decode 389.2 GB/s   prefill v2 128x64  354,108 tok/s
+    16x2560 g_proj         36           decode  16.1 GB/s   prefill v1  64x64  4,273,504 tok/s
+    2560x4096 out          36           decode 274.8 GB/s   prefill v2  64x64  788,644 tok/s
+    6144x2560 qkv          36           decode 337.7 GB/s   prefill v2  64x64  545,275 tok/s
+
+Profile against the heuristic on the same binary, 500-token prompt, ctx 512:
+917.8 tok/s against 892.3 (+2.9%), and the logits are bit-identical
+(relL2 0.000000%, maxabs 0, top-100 100/100, KL 0 both directions): a tile
+changes which tokens share a block, never the per-token K order. Decode in
+that pair of runs was 64.3 against 62.4 tok/s, inside run-to-run noise. The
+sweep itself takes about 4 s per artifact. A DQVQ artifact sweeps too, but
+records legacy prefill for every geometry (no tiled path), so its prompt stays
+token by token.
+
 ## 3. Decisions and why
 
 - DQV3 is the payload to build. Same container size, same quality, and it is
@@ -199,10 +225,10 @@ dim 8 with 8192, and the DQVQ build of 8192):
 ## 4. Open work, in priority order
 
 1. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
-   and gated (section 2): 851-868 tok/s at 128-512 tokens against 1743 tok/s
-   for artifact-only matrix work, so roughly half the prompt time is the
-   batched attention, four transposes per layer, the norms and 512 embedding
-   row dequeues. Candidate work, in the order the numbers suggest: batch the
+   and gated (section 2), and the tile shapes are now measured per geometry
+   (851-918 tok/s at 500-512 tokens against 1743-1909 tok/s for artifact-only
+   matrix work), so roughly half the prompt time is the batched attention,
+   four transposes per layer, the norms and 512 embedding row dequeues. Candidate work, in the order the numbers suggest: batch the
    embedding row dequeue into one launch; fuse the transpose into the norm and
    gelu kernels; and revisit the B-tile load's 4-way bank conflict (it reads
    xT column-major and writes shared token-major) plus a 256-token B tile if
@@ -234,6 +260,12 @@ new module, not repairing one.
 
 3. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
    also lose both fast kernels, so expect the per-index rates.
+4. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
+   first (three words, the shape v3_rounds uses); the tile table would then
+   carry it. Per-layer profiles are possible but pointless while matrices
+   share a geometry: the sweep already shows the winner depends on the shape,
+   not the layer. A load-time autotune inside the runtime is the alternative to
+   the profile file, and it would pay the sweep on every cold start.
 
 ## 5. Resume
 
@@ -250,6 +282,9 @@ new module, not repairing one.
     ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512 --no-prefill --logits /tmp/gpu-tok.f32
+    ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
+    ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046 --ctx 64 --profile other.profile   # refused (foreign artifact)
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids <512 ids> --gen 0 --ctx 1024 [--chunk 512]   # prompt rate
     ./bin/logits-diff /tmp/gpu-tok.f32 /tmp/gpu.f32 --top 25   # prompt paths against each other
     ./bin/logits-diff /tmp/hf.f32 /tmp/vq.f32 --top 20
@@ -297,6 +332,19 @@ new module, not repairing one.
   bit-identical: 600 tokens as 512+88 and as one 600-token chunk gave relL2 0,
   so a rate difference between chunk sizes is scheduling, not arithmetic.
   --no-prefill runs the token-by-token path and is the gate's reference.
+- A tuning profile is bound to the artifact fingerprint and the device name.
+  A profile from another artifact, another GPU, or a changed container is
+  refused with a printed reason and the heuristic runs; --no-tune skips the
+  file entirely. Never copy a profile between artifacts to save a sweep.
+- Stage buffers need 8 bytes of slack past the payload. The kernels read
+  aligned 4- and 8-byte index windows, so the last index of the last row
+  reaches up to 7 bytes past the stream; the C driver, the Rust harness, the
+  model runtime and the tuner all allocate per + 8 and zero it. compute-
+  sanitizer flags the read as out of bounds without it (2026-10-31), even
+  though cudaMalloc's granularity had hidden it for the whole project.
+- BK 128 is not in the tile table on purpose: the A-tile extracts four code
+  words from one 64-bit window, and eight would need 96 bits. It produced
+  relL2 0.669 when it was offered, which is what the gate exists to catch.
 - The prefill gate's relL2 (0.0055% at 5 tokens, 0.15% at 600) is larger than
   the token path's against the CPU (0.000027%, 0.000863%) because the mma
   kernel rounds activations to f16. Do not read that as a regression, and do

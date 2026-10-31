@@ -19,7 +19,9 @@ Two artifact families live here and they are not the same thing:
   whole-model GPU runtime (tools/vq/gpu/vq-model-gpu.cu). Both are in section
   8b; the GPU one is gated against the CPU reference, decodes at 71 tok/s
   (24x the reference at the 4x8192 x2 point) and ingests a prompt at about
-  850 tok/s through the tiled prefill.
+  850 tok/s through the tiled prefill. Its kernel shapes are measured per
+  artifact by bin/vq-tune (section 8c), which writes the profile the runtime
+  reads.
 
 Know which one a request is about before acting.
 
@@ -489,6 +491,60 @@ cannot take (4x1024 x1 has a 10-bit stream) runs the prompt token by token and
 prints that it does. `--no-prefill` forces the token-by-token path and
 `--chunk N` sets the chunk size.
 
+## 8c. Tune the VQ kernels per model (bin/vq-tune)
+
+The kernel shapes are no longer build constants. The tiled prefill is a
+template over its tile (BN token tile, BK column round) and its codebook
+placement, and the GEMV takes a launch width. `bin/vq-tune` measures the legal
+choices on one artifact's real payloads and writes `<artifact>/vq-tune.profile`;
+`bin/vq-model-gpu` and `bin/vq-bench` read that file when it matches the
+artifact and the device, and keep the readiness heuristic otherwise.
+
+    ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7
+    ./bin/vq-model-gpu --dir DIR --ids LIST              # uses the profile
+    ./bin/vq-model-gpu --dir DIR --ids LIST --no-tune    # heuristic only
+
+Per distinct matrix geometry (6 in this model, not 216) it asks the library
+which variants and tiles are legal, times each on the real container with CUDA
+events, rejects any candidate whose output moves past relL2 1e-4 against the
+default, and keeps the fastest. A 3.2 GB artifact sweeps in about 4 s. The
+profile is bound to the artifact fingerprint (FNV-1a over manifest.txt and the
+two 4 KB edges of every container) and to the device name; a foreign or stale
+profile is refused with a printed reason, never applied.
+
+Measured 2026-10-31, 4x8192 x2 (DQV3), 12 entries:
+
+| geometry | matrices | decode GB/s | prefill tile | prefill tok/s |
+|---|---:|---:|---|---:|
+| 131072x2560 embedding | 1 | 378.0 | v1 256x64 | 22,083 |
+| 2560x10240 down | 36 | 328.1 | v2 64x64 | 321,246 |
+| 10240x2560 gate/up | 72 | 389.2 | v2 128x64 | 354,108 |
+| 16x2560 g_proj | 36 | 16.1 | v1 64x64 | 4,273,504 |
+| 2560x4096 out | 36 | 274.8 | v2 64x64 | 788,644 |
+| 6144x2560 qkv | 36 | 337.7 | v2 64x64 | 545,275 |
+
+The profile is numerically neutral, not merely inside the f16 gate: the tile
+shape changes which tokens share a block, never the per-token K order, so
+logits against `--no-tune` are relL2 0.000000%, maxabs 0, top-100 100/100,
+KL 0 both directions. The model-level effect is the prompt rate: 500 tokens
+917.8 tok/s against 892.3 on the heuristic (+2.9%); decode is unchanged within
+run-to-run noise (64.3 against 62.4 tok/s in one pair of runs, 70.8 measured
+earlier on the same artifact). Most of the prompt time is still the batched
+attention, the transposes and the norms, not the matrix kernels.
+
+DQVQ artifacts sweep too, but their payload has no tiled prefill path at all
+(the round map reads the row-local DQV3 stream), so the profile records the
+legacy prefill for every geometry and the runtime keeps the token-by-token
+prompt and prints why. Only the GEMV choice differs on those artifacts.
+
+Two rules a change must preserve:
+
+- A tiled tile is chosen whenever one fits; legacy is recorded only when none
+  does. One legacy matrix switches the whole prompt off the chunked path.
+- BK 128 is not offered. The A-tile extracts four code words from one 64-bit
+  window; BK 128 needs eight (96 bits) and would truncate silently. Adding it
+  means a three-word 96-bit window first, the shape v3_rounds already uses.
+
 ## 9. Pitfalls that cost time here
 
 - Do not trust a hardcoded context. `config.json` says 1,048,576; the repo serves
@@ -519,6 +575,8 @@ prints that it does. `--no-prefill` forces the token-by-token path and
     tools/vq/gpu/decode-gpu.cu  CUDA decode, GEMV, tiled prefill kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
+    tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
+    tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)

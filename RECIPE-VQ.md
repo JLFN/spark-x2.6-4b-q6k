@@ -4,8 +4,9 @@ Status: encoder in-repo and working; two runtimes load and run the artifacts.
 The CPU f32 reference is gated against the bf16 checkpoint and against
 llama.cpp, and the GPU model runtime is gated against that reference; it
 decodes at 71 tok/s on 4x8192 x2, 24x the reference, and ingests a prompt at
-about 850 tok/s on the tiled prefill (section 8, item 2, and AGENTS.md
-section 8b). The measurements below are the reason the next step is
+about 850-918 tok/s on the tiled prefill (section 8, item 2, and AGENTS.md
+sections 8b and 8c). bin/vq-tune now measures the kernel shapes per artifact
+and the runtime consumes the profile. The measurements below are the reason the next step is
 a decision, not a build order, and the runtime did not change the verdict on
 quality. AGENTS.md section 5 carries the fuller sweep, the whole-checkpoint
 builds and the whole-model k-quant comparison measured after this file was
@@ -336,10 +337,22 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    What the reference runtime did settle: the container, the decoder and a
    correct forward pass are no longer open questions. The block GEMV and the
    tiled prefill are both wired into the GPU model runtime now (299 GB/s and
-   71 tok/s decode end to end; 851-868 tok/s prompt ingestion); the remaining
+   71 tok/s decode end to end; 851-918 tok/s prompt ingestion); the remaining
    speed work is closing the gap between the model-level prompt rate and the
-   artifact-only 1743 tok/s, which is attention and layout overhead rather
+   artifact-only 1743-1909 tok/s, which is attention and layout overhead rather
    than matrix work.
+   The kernel shapes are measured per artifact, not assumed: bin/vq-tune
+   (AGENTS.md section 8c) sweeps the legal GEMV variants, launch widths and
+   prefill tiles on the real containers, rejects anything outside relL2 1e-4
+   of the default, and writes <artifact>/vq-tune.profile, which the runtime
+   reads only when the artifact fingerprint and the device match. On 4x8192 x2
+   the profile is bit-identical to the heuristic (relL2 0.000000%, top-100
+   100/100) and moves a 500-token prompt from 892.3 to 917.8 tok/s; the tiles
+   it picks differ per geometry (128x64 for gate/up, 64x64 for down and qkv,
+   256x64 for the embedding), which is exactly why one build constant was the
+   wrong shape for the job. A DQVQ artifact sweeps too, but has no tiled
+   prefill path, so its profile records legacy prefill and the runtime keeps
+   the token-by-token prompt.
 
 3. MTP / DSpark on top. The draft model reads target hidden states at layers
    2, 10, 18, 25 and 33. Weight format does not matter to the draft; what matters
