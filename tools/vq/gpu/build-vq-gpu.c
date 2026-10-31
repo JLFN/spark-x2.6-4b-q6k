@@ -104,7 +104,7 @@ int main(int argc, char ** argv) {
             uint32_t rows = (uint32_t) n, cols = 1;
             fwrite(&rows, 4, 1, f); fwrite(&cols, 4, 1, f);
             fwrite(v, 4, n, f);
-            fprintf(mf, "%s %zu 1 0 %zu -1\n", E->name, n, 4 * n);
+            fprintf(mf, "%s %zu 1 0 %zu -1\n", E->name, n, 12 + 4 * n);
             fclose(f); free(v);
             continue;
         }
