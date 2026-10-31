@@ -5,3 +5,6 @@ models/hf/
 # build scratch
 out/build/
 models/server.log
+
+# graphify-rs output
+graphify-out/
