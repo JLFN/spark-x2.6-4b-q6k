@@ -132,7 +132,7 @@ Measured and recorded in the ds4 tree:
 | Family | KV layout | Cost |
 |---|---|---|
 | DeepSeek-V4.1 | packed FP4: main KV 512 dims = 256 B nibbles + 32 B E4M3 scales = 288 B per group; index K = 64 B nibbles + 4 B E8M0, padded to 72 B (ds41_kvfmt.h:7-11) | one KV head, 512-dim latent |
-| A.X-K2 (VQ) | 770 bytes per token: a 641-byte latent row plus a 129-byte index key (docs/axk2-vq.md) | 11.47 GiB per 262,144-token bank |
+| A.X-K2 (VQ) | 770 bytes per token and layer: a 641-byte latent row plus a 129-byte index key (docs/axk2-vq.md); 61 layers gives 11.47 GiB per 262,144-token bank | ~47 KB per token overall |
 | Beam-VQ | sliding layers keep f16 rings of 512; full layers keep FP8 rows, 2,080 bytes per token and layer (docs/beam-vq.md:48) | 18.28 GiB at 1M |
 
 That compactness comes from those families' latent or compressed KV designs and
@@ -165,8 +165,18 @@ including one serving the existing Q6_K.
 
 At 1M the same packing changes the verdict on context: 10,368 B/token at a plain
 4-bit packing is about 10.4 GiB, still too large beside 2,960 MiB of weights, so
-only a latent scheme in A.X-K2's class (770 B/token, 807 MiB at 1M) would make the
-full window reachable, and Spark has no such compressor.
+only a latent scheme in the class of DeepSeek V4.1 would make the full window
+reachable, and Spark has no compressor of that kind.
+
+Why the ds4 numbers are so small, and Spark's are not. Spark's own GGUF metadata
+(`spark2_5.attention.*`) declares 36 layers, 4 KV heads, key and value length 256,
+and a sliding_window_pattern with 27 true and 9 false entries, so nine layers keep
+full attention. At 1,048,576 tokens that is 9 x 1,048,576 x 2 x 4 x 256 values:
+38.7 GB at f16 (36.0 GiB) and 19,613 MiB at q8_0. DeepSeek V4.1 instead keeps one
+KV head with a 512-dim latent, packed as FP4 with E4M3 scales per 16-token group,
+and only four source layers carry it (`kv-sources=[2,8,14,20]`); its account is
+about 890 bytes per token, which is 0.93 GB at 1M. That is an architectural
+compressor, not a storage format, and it cannot be applied to Spark's GQA cache.
 
 The measured 1M table, one command per KV assumption (card 12,282 MiB):
 
