@@ -95,11 +95,14 @@ reproduce the loop.
     RECIPE-DOMAIN.md  the ds4 domain-sidecar mechanism, what maps to Spark, and the build order
     THIRD_PARTY.md    provenance and licenses for the vendored VQ encoder
     tools/vq/         the dense-VQ encoder, vendored and buildable here
-      build.sh                builds bin/eg2_vq, rvq, quant_err and plan
+      build.sh                builds eg2_vq, rvq, quant_err, plan, build-vq and build-vq-gpu
       eg2_vq.c                the encoder (copy of the EmbeddingGemma tool)
       rvq.c                   residual VQ: stacks stages to reach higher rates
       quant_err.c             llama.cpp k-quant error on one HF matrix
       plan.c                  artifact size and VRAM planner: ./bin/plan models/hf --vq 4 4096 2
+      build-vq.c              whole-checkpoint VQ builder, per-tensor containers
+      gpu/vq_gpu.cu           device-resident Lloyd and assignment (CUDA)
+      gpu/build-vq-gpu.c      GPU driver: whole checkpoint in about 22 s
       vendor/                 YoungAi VQ headers, MIT, pinned
     tools/kquant/     llama.cpp's ggml quantizer, vendored, plus its stubs
     tools/runtime/    build-runtime.sh: fetches and builds the pinned llama.cpp trees

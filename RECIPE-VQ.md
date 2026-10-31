@@ -55,7 +55,8 @@ The encoder used to live in /data/embeddinggemma2 and read headers from
     tools/vq/quant_err.c     new: k-quant error on one HF matrix
     tools/vq/rvq.c           new: residual (multi-stage) VQ encoder
     tools/vq/plan.c          new: artifact size and VRAM planner with --budget
-    tools/vq/build.sh        builds bin/eg2_vq, rvq, quant_err and plan
+    tools/vq/build-vq.c      new: whole-checkpoint builder (per-tensor containers + manifest)
+    tools/vq/build.sh        builds bin/eg2_vq, rvq, quant_err, plan and build-vq
     tools/kquant/vendor/     llama.cpp's ggml-quants.c and its headers, MIT
     tools/kquant/stubs.c     the four ggml entry points that file needs
     tools/runtime/build-runtime.sh  clones and builds the pinned llama.cpp trees
@@ -122,7 +123,99 @@ The Q4_K row is a plain Q4_K, not the official Q4_K_M mix, so it under-predicts
 that file by about 1 GiB; use the Q4_K_M row's real size (3,543,441,312 B) when
 budgeting that artifact.
 
-## 5. The VQ path reads the checkpoint, not a GGUF
+## 5. Building the artifact
+
+build-vq walks the checkpoint index and writes one container per tensor plus a
+manifest, in parallel:
+
+    ./bin/build-vq models/hf models/vq-build 4 1024 1 --jobs 12
+    # encoding: dim=4 nc=1024 stages=1
+    # 290 tensors: 288 matrices encoded, 2 norms copied as f32
+
+Per tensor the container is [RQVQ header][stage 1][stage 2]..., where each stage
+is exactly the payload vq_pack writes ([DQVQ header][codebook nc*dim f16][row
+gains f16][index stream]). The manifest records name, rows, cols, stages and the
+file size, so the artifact is reproducible and checkable without the encoder.
+
+A 26.2 M-weight matrix at dim 4 / 1024 codewords takes about a minute on one
+core, so the whole checkpoint needs a parallel run; --jobs 12 is the setting used
+here. The embedding is encoded too unless --no-embed is passed, since on this
+model it is a tied 131,072 x 2,560 matrix and a large share of the file.
+
+## 5b. GPU conversion
+
+The GPU path is built and measured. build-vq-gpu runs Lloyd and the assignment on
+the card with device pointers, so nothing crosses PCIe inside the loop, and the
+codebook is staged in 1024-codeword shared-memory tiles instead of the reference's
+single tile.
+
+| Work | CPU (1 core) | GPU | Speedup |
+|---|---:|---:|---:|
+| one 2560 x 10240 matrix, dim 4, nc 1024 | 22.0 s | 0.2 s | about 110x |
+| whole checkpoint, 217 matrices + 73 copied norms | about 11 min (12 workers, unfinished) | 22.4 s | about 30x against the parallel CPU build |
+
+Quality is unchanged: the same matrix reconstructs at relL2 23.0985% on the CPU and
+23.1014% on the GPU, with the same 8,205,329-byte payload. The small difference is
+FP64 atomic summation order in the centroid update, which also means the GPU path
+is not byte-deterministic run to run; the CPU path remains the reference when
+identical bytes matter.
+
+    ./bin/build-vq-gpu models/hf models/vq-build-gpu 4 1024 1
+    # 217 tensors in 22.4 s, 1.3 GB, manifest with per-tensor relL2
+
+Why the reference kernels could not be used as-is, measured here: this card
+reports pageableMemoryAccess = 0 (probe, RTX 4070 SUPER sm_89, 56 SMs), so the
+ds4 kernels that take host pointers fault unless driven through pinned host
+memory, and the embeddinggemma run measured that path 1.25-3x slower than CPU per
+tensor on this card because of PCIe. Its single-tile shared-memory gate (48 KiB)
+also refuses dim 4 with 4096 codewords (81,920 bytes). The local kernels avoid
+both problems: device pointers, and tiled codewords.
+
+## 6. Calibrated VQ: what the ds4 toolchain has
+
+/data/ds4-dfm-rs/tools/vq_calib is the calibration pipeline that produced a
+calibrated VQ release. Its README splits the pieces into family-specific and
+family-independent, which is the map to follow for Spark:
+
+| Piece | In vq_calib | Spark |
+|---|---|---|
+| source reader | axk2_source.py, FP8 with 128x128 block scales | not needed: Spark ships BF16 safetensors |
+| reference forward + stats hooks | axk2_ref.py, selftest_ref.py | must be written against modeling_spark.py |
+| calibration corpus | build_calib.py (seeded, pinned revisions, think and non-think) | adapt to Spark's tokenizer and chat template |
+| statistics | collect_stats.py, run_collect.sh, reduce_stats.py | same shape, one rank per GPU, FP64 sums |
+| weighting | axk2_weighting.py (none/row/imatrix/imatrix_freq/output) | the MoE modes do not apply; see below |
+| weighted Lloyd and pack | cuda/axk2_vq_convert.cu, axk2_vq_gpu.py | already present in tools/vq/vendor |
+| container and release | axk2_vq_format.py, assemble_release.py, publish_release.py | a Spark writer has to be written |
+| evaluation | measure_layer.py, eval_e2e.py, router_mask_ab.py | held-out KL and teacher-forced agreement |
+
+The important discovery is that the vendored encoder already implements
+calibration-weighted assignment: vq_encode_full takes X, an [n_act x cols] block
+of input activations, and computes per 128-column group H = X^T X, inverts it, and
+weights each column by 1/diag(H^-1), the GPTQ-consistent cost. The comment in
+vq_qc.h records why: plain E[x^2] weighting measured worse (KLD 0.46186 ->
+0.48138) because it over-protects columns whose error later columns can
+compensate. So the encoder side needs no new code; what is missing is X.
+
+What Spark needs, in order:
+
+1. An activation collector. Load models/hf with transformers and the checkpoint's
+   own modeling_spark.py (trust_remote_code), run a calibration corpus, and dump
+   per-tensor input activations for the matrices being quantized. On 12 GB this
+   has to stream layer by layer and write chunks, the way collect_stats.py does
+   for its family; a full 128-batch capture does not fit.
+2. A --stats path in build-vq that feeds those chunks to vq_encode_full instead
+   of NULL.
+3. A held-out evaluation. Per-tensor relL2 (bin/quant_err, eg2_vq) is a proxy;
+   the real gate is KL on held-out text against the BF16 model, which needs a
+   forward that can run the VQ weights. Until Spark has a runtime that decodes
+   VQ, the gate stays at per-tensor and per-layer error.
+4. A Spark container writer and loader, for the same reason.
+
+Not needed for Spark: the MoE-specific weighting modes, the router-bias A/B, the
+FP8 source reader and the non-expert Q4_K path. Spark's 36 layers are dense and
+its matrices are plain BF16.
+
+## 7. The VQ path reads the checkpoint, not a GGUF
 
 The conversion starts from the HF checkpoint in models/hf: 5 safetensors shards,
 model.safetensors.index.json, config.json and the tokenizer files. Every tool in
@@ -188,7 +281,7 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
 1,079-1,434 MiB. It is not measured at 1M and may grow with context, so treat any
 1M row as a lower bound of a few hundred MiB.
 
-## 6. What a runnable VQ Spark still needs
+## 8. What a runnable VQ Spark still needs
 
 1. Encoder pass over the full model. eg2_vq handles one tensor at a time and reads
    HF safetensors. A driver must walk the 290 tensors, keep 1-D tensors
@@ -219,7 +312,7 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    the paired draft. A Q3_K-class artifact must clear the same bar as the Q6_K
    before it is publishable.
 
-## 7. Decision rule
+## 9. Decision rule
 
 Do not start the runtime work until the encoder shows VQ beating Q4_K per bit on
 at least the FFN matrices, because that is the only outcome that would justify a

@@ -4,6 +4,8 @@ models/hf/
 models/dspark/*.gguf
 models/dspark/*.log
 models/instruct/*.gguf
+models/vq-build/
+models/vq-build-gpu/
 
 # build scratch
 out/build/

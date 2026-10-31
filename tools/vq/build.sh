@@ -32,7 +32,23 @@ echo "built $ROOT/bin/rvq"
 $CC $CFLAGS $VQ_INC -o "$ROOT/bin/plan" "$ROOT/tools/vq/plan.c"
 echo "built $ROOT/bin/plan"
 
+$CC $CFLAGS $VQ_INC -o "$ROOT/bin/build-vq" "$ROOT/tools/vq/build-vq.c" -lm
+echo "built $ROOT/bin/build-vq"
+
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
   "$ROOT/tools/vq/quant_err.c" "$ROOT/tools/kquant/stubs.c" "$OBJ/ggml-quants.o" -lm
 echo "built $ROOT/bin/quant_err"
+
+# GPU path: device-resident Lloyd and assignment. Needs nvcc.
+NVCC=${NVCC:-/usr/local/cuda-13.3/bin/nvcc}
+ARCH=${ARCH:-89}
+if [ -x "$NVCC" ]; then
+  $NVCC -O3 -std=c++17 -arch=sm_$ARCH -c -o "$OBJ/vq_gpu.o" "$ROOT/tools/vq/gpu/vq_gpu.cu"
+  $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/build-vq-gpu" \
+    "$ROOT/tools/vq/gpu/build-vq-gpu.c" "$OBJ/vq_gpu.o" -lm -lstdc++ -L/usr/local/cuda/lib64 -lcudart \
+    -Wl,-rpath,/usr/local/cuda/lib64
+  echo "built $ROOT/bin/build-vq-gpu"
+else
+  echo "skipped build-vq-gpu: $NVCC not found"
+fi
