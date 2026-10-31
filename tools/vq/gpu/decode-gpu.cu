@@ -34,7 +34,7 @@ struct layout {
     int dim, nc, rows, cols, nbit, v3;
     unsigned mask;
     size_t cb_off, gain_off, stream_off, nidx, nidx_row;
-    size_t mrow, prow;   /* DQV3: bytes per row of the 12-bit main stream and of the plane */
+    size_t mrow, prow;   /* DQV3: bytes per row of the main stream (min(bits,12)) and of the plane */
 };
 
 static layout make_layout(int dim, int nc, int rows, int cols, int v3) {
@@ -55,11 +55,12 @@ static layout make_layout(int dim, int nc, int rows, int cols, int v3) {
     return L;
 }
 
-/* Preconditions of the DQV3 block kernel: a v3 payload whose index stream
- * starts on a 4-byte boundary in every row, with no partial 32-index group
- * (the rounds map assumes whole groups; a partial one would read past x). */
+/* Preconditions of the DQV3 block kernel: a 12-bit main stream (nc >= 4096;
+ * below that the stream is narrower and this kernel's 96-bit round map does
+ * not describe it), a v3 payload whose index stream starts on a 4-byte
+ * boundary in every row, and no partial 32-index group. */
 static int v3_blk_ok(const layout & L) {
-    return L.v3 && L.nidx_row % 32 == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
+    return L.v3 && L.nbit >= 12 && L.nidx_row % 32 == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
 }
 
 /* DQV3 carries 12 main-stream bits plus one plane bit, so nc above 8192 would
@@ -92,11 +93,17 @@ __device__ __forceinline__ uint32_t rd_idx(const uint8_t * s, size_t i, int nbit
  * (ds41_vq_row.cuh:7-20, :122-137). */
 __device__ __forceinline__ uint32_t rd_idx_fmt(const uint8_t * st, const layout & L, size_t r, size_t i) {
     if (!L.v3) return rd_idx(st, r * (size_t) (L.cols / L.dim) + i, L.nbit, L.mask);
+    /* The v3 main stream is min(bit_width, 12) bits wide (build-vq-gpu.c:59
+     * packs mb = bits > 12 ? 12 : bits), not always 12: a 4096-codebook
+     * payload is 12-bit, a 1024 one is 10-bit and its rows are correspondingly
+     * shorter. Reading a fixed 12 here decoded the wrong weights for every nc
+     * below 4096 and, at nc 1024, produced indices past the codebook. */
+    const uint32_t mb = L.nbit > 12 ? 12u : (uint32_t) L.nbit;
     const uint8_t * base = st + r * L.mrow;
-    const size_t bit = i * 12;
+    const size_t bit = i * mb;
     const uint8_t * q = base + (bit >> 3);
     const uint32_t w = (uint32_t) q[0] | ((uint32_t) q[1] << 8) | ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24);
-    uint32_t v = (w >> (bit & 7)) & 0xFFFu;
+    uint32_t v = (w >> (bit & 7)) & ((1u << mb) - 1u);
     if (L.prow) {
         const uint8_t * pl = st + L.mrow * (size_t) L.rows + r * L.prow;
         v |= (uint32_t) ((pl[i >> 3] >> (i & 7)) & 1u) << 12;
@@ -284,6 +291,214 @@ __global__ void gemv_v3blk_kernel(const uint8_t * p, const layout L, const float
     if (lane == 0) y[r] += acc * __half2float(gr[r]);
 }
 
+/* ==== Tiled prefill: f16 tensor cores =====================================
+ *
+ * One block computes 128 weight rows x 128 tokens over all K, stepping BK 64
+ * columns per round: 16 warps = 8 row tiles of 16 rows x 2 token halves; a
+ * warp owns 16 rows and 8 n8 slices, and a round is 4 k16 mma groups. The tile
+ * shape, the 16-warp split, the ldmatrix addressing and the 16-byte-chunk XOR
+ * swizzle are ds4-dfm-rs cuda/ds41_vq_prefill_mma.cuh:52-58 and :82-94; the
+ * per-round tile fill and the k16 loop follow :167-201 there.
+ *
+ * Named deviation from that reference: ds4 runs bf16 products because its
+ * codebook is E4M3 (3 mantissa bits, exact in bf16). Ours is f16, 10 mantissa
+ * bits, and bf16 would round every learned codeword by 2^-8 - a quality
+ * change, not a layout choice. So the tile is f16: a code word is a straight
+ * 8- or 16-byte copy out of the codebook with no conversion at all, the
+ * activations are rounded f32 -> f16 (10 bits, not 7), and the mma is
+ * f32.f16.f16.f32. An f16 x f16 product is exact in f32.
+ *
+ * The mma starts every k16 from zero and adds back with a plain FADD (ds4's
+ * 2026-09-24 finding at :188-192: letting K accumulate inside the tensor
+ * core's own f32 adder truncates low bits on alignment instead of rounding).
+ */
+#define PRE_BM      128
+#define PRE_BN      128
+#define PRE_BK      64
+#define PRE_THREADS 512
+
+/* A tile row is 64 f16 = 8 chunks of 16 B; chunk ^ (row & 7) spreads the 8
+ * rows ldmatrix reads at once over 8 bank groups (ds4 :83). */
+__device__ __forceinline__ uint32_t pre_swz(uint32_t row, uint32_t chunk) {
+    return row * 128u + ((chunk ^ (row & 7u)) << 4);
+}
+
+__device__ __forceinline__ void pre_ldsm4(uint32_t * r, const uint8_t * p) {
+    const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void pre_mma(float * c, const uint32_t * a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t pre_h2u(__half2 h) { return *reinterpret_cast<uint32_t *>(&h); }
+
+/* CB 0 keeps the codebook in global (it is 32-64 KB: it stays in L1 under
+ * three resident blocks), CB 1 stages it in shared behind the two tiles. */
+template <int CB, int DIM>
+__global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
+        const uint8_t * p, const layout L, const float * xT, int ntok, float * y) {
+    constexpr uint32_t CW  = PRE_BK / (uint32_t) DIM;    /* code words per row-round: 16 (dim 4), 8 (dim 8) */
+    constexpr uint32_t TPR = 4u, CPT = CW / TPR;         /* 4 threads per row, 4 / 2 code words each */
+    constexpr uint32_t NFW = PRE_BN / 16u;               /* n8 slices per warp (8) */
+    constexpr uint32_t NCH = PRE_BN * 8u / PRE_THREADS;  /* B-tile 16 B chunks per thread (2) */
+    extern __shared__ __align__(16) uint8_t sh[];
+    uint8_t * As = sh, * Bs = sh + PRE_BM * PRE_BK * 2u;
+    uint8_t * cbs = Bs + PRE_BN * PRE_BK * 2u;
+    const __half * cb = (const __half *) (p + L.cb_off);
+    const __half * gr = (const __half *) (p + L.gain_off);
+    const uint8_t * st = p + L.stream_off;
+    const uint8_t * pl = L.prow ? st + L.mrow * (size_t) L.rows : NULL;
+
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t wr = warp & 7u, th = warp >> 3u;
+    if (CB) {   /* the codebook bytes are already the tile format: copy, no convert */
+        const uint2 * src = (const uint2 *) cb;
+        uint2 * dst = (uint2 *) cbs;
+        for (uint32_t i = tid; i < (uint32_t) L.nc * (uint32_t) L.dim * 2u / 8u; i += PRE_THREADS)
+            dst[i] = __ldg(src + i);
+    }
+
+    const uint32_t ar = tid / TPR, sub = tid % TPR;      /* A-tile row this thread fills */
+    const int r0 = (int) blockIdx.x * PRE_BM, t0 = (int) blockIdx.y * PRE_BN;
+    const int nt = min(PRE_BN, ntok - t0);
+    const int nrnd = (int) (L.cols / PRE_BK);
+    const bool rv = r0 + (int) ar < L.rows;
+    const uint32_t rsrc = (uint32_t) (rv ? r0 + (int) ar : 0);
+    const uint8_t * rowp = st + (size_t) rsrc * L.mrow;
+    const uint8_t * rowq = pl ? pl + (size_t) rsrc * L.prow : NULL;
+
+    float acc[NFW][4];
+    #pragma unroll
+    for (uint32_t f = 0; f < NFW; f++) acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = 0.f;
+    __syncthreads();
+
+    for (int i = 0; i < nrnd; i++) {
+        /* This thread's code words of round i sit at bit 12*(i*CW + sub*CPT).
+         * Two aligned words are read and shifted; the offset inside them is
+         * 0 or 16 for dim 4 and in {0,8,16,24} for dim 8, and CPT*12 <= 48, so
+         * every index of the round stays inside the 64-bit window. */
+        const uint32_t bit = (uint32_t) i * 12u * CW + sub * 12u * CPT;
+        const uint32_t aoff = (bit >> 5) << 2, sh64 = bit & 31u;
+        uint32_t w0 = 0, w1 = 0, eb = 0;
+        if (rv) {
+            w0 = __ldg((const uint32_t *) (rowp + aoff));
+            w1 = __ldg((const uint32_t *) (rowp + aoff + 4u));
+            if (rowq) eb = (uint32_t) __ldg(rowq + ((uint32_t) i * CW + sub * CPT) / 8u);
+        }
+        /* The next round's activations, converted here so the global latency
+         * overlaps the previous round's mma (ds4 :163-175). */
+        uint4 bx[NCH];
+        #pragma unroll
+        for (uint32_t c = 0; c < NCH; c++) {
+            const uint32_t ch = tid + c * PRE_THREADS, t = ch >> 3, cc = ch & 7u;
+            bx[c] = make_uint4(0, 0, 0, 0);
+            if ((int) t < nt) {
+                const float * s = xT + (size_t) ((uint32_t) i * PRE_BK + cc * 8u) * (size_t) ntok
+                                + (size_t) (t0 + (int) t);
+                const size_t S = (size_t) ntok;
+                bx[c].x = pre_h2u(__floats2half2_rn(s[0], s[S]));
+                bx[c].y = pre_h2u(__floats2half2_rn(s[2 * S], s[3 * S]));
+                bx[c].z = pre_h2u(__floats2half2_rn(s[4 * S], s[5 * S]));
+                bx[c].w = pre_h2u(__floats2half2_rn(s[6 * S], s[7 * S]));
+            }
+        }
+        __syncthreads();   /* the previous round's tiles are done being read */
+
+        const uint64_t u = ((uint64_t) w1 << 32) | (uint64_t) w0;
+        #pragma unroll
+        for (uint32_t q = 0; q < CPT; q++) {
+            const uint32_t j = sub * CPT + q;                     /* code word of this round */
+            uint32_t v = (uint32_t) (u >> (sh64 + 12u * q)) & 0xFFFu;
+            if (rowq) v |= ((eb >> (j & 7u)) & 1u) << 12;
+            if (DIM == 4) {   /* 8-byte code word: half of a 16 B chunk */
+                const uint8_t * src = CB ? cbs + (size_t) v * 8u : (const uint8_t *) cb + (size_t) v * 8u;
+                const uint2 cw = CB ? *(const uint2 *) src : __ldg((const uint2 *) src);
+                *(uint2 *) (As + pre_swz(ar, j >> 1) + ((j & 1u) << 3)) = cw;
+            } else {   /* dim 8: one code word is one 16 B chunk, two aligned 8 B halves */
+                const uint8_t * src = CB ? cbs + (size_t) v * 16u : (const uint8_t *) cb + (size_t) v * 16u;
+                const uint2 lo = CB ? *(const uint2 *) src : __ldg((const uint2 *) src);
+                const uint2 hi = CB ? *(const uint2 *) (src + 8u) : __ldg((const uint2 *) (src + 8u));
+                uint8_t * dst = As + pre_swz(ar, j);
+                *(uint2 *) dst = lo;
+                *(uint2 *) (dst + 8u) = hi;
+            }
+        }
+        #pragma unroll
+        for (uint32_t c = 0; c < NCH; c++) {
+            const uint32_t ch = tid + c * PRE_THREADS;
+            *(uint4 *) (Bs + pre_swz(ch >> 3, ch & 7u)) = bx[c];
+        }
+        __syncthreads();
+
+        /* The warp's 16 rows over this half's n8 slices. */
+        #pragma unroll
+        for (uint32_t kk = 0; kk < PRE_BK / 16u; kk++) {
+            const uint32_t mt = lane >> 3;
+            uint32_t a[4];
+            pre_ldsm4(a, As + pre_swz(wr * 16u + (lane & 7u) + (mt & 1u) * 8u, kk * 2u + (mt >> 1)));
+            #pragma unroll
+            for (uint32_t np = 0; np < NFW / 2u; np++) {
+                const uint32_t f0 = th * NFW + 2u * np;
+                if ((int) (f0 * 8u) >= nt) break;
+                uint32_t b[4];
+                pre_ldsm4(b, Bs + pre_swz((f0 + (mt >> 1)) * 8u + (lane & 7u), kk * 2u + (mt & 1u)));
+                float t0v[4] = {0.f, 0.f, 0.f, 0.f};
+                pre_mma(t0v, a, b[0], b[1]);
+                #pragma unroll
+                for (uint32_t e = 0; e < 4u; e++) acc[2 * np][e] += t0v[e];
+                if ((int) ((f0 + 1u) * 8u) < nt) {
+                    float t1v[4] = {0.f, 0.f, 0.f, 0.f};
+                    pre_mma(t1v, a, b[2], b[3]);
+                    #pragma unroll
+                    for (uint32_t e = 0; e < 4u; e++) acc[2 * np + 1][e] += t1v[e];
+                }
+            }
+        }
+    }
+
+    /* Exit: c0,c1 = row lane/4, token (lane&3)*2+{0,1}; c2,c3 = row + 8. */
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t r = (uint32_t) r0 + wr * 16u + (lane >> 2) + h * 8u;
+        if (r >= (uint32_t) L.rows) continue;
+        const float g = __half2float(__ldg(gr + r));
+        #pragma unroll
+        for (uint32_t f = 0; f < NFW; f++) {
+            const uint32_t gf = th * NFW + f;
+            if ((int) (gf * 8u) >= nt) break;
+            #pragma unroll
+            for (uint32_t e = 0; e < 2u; e++) {
+                const uint32_t t = gf * 8u + (lane & 3u) * 2u + e;
+                if ((int) t >= nt) continue;
+                y[(size_t) (t0 + (int) t) * L.rows + r] += acc[f][h * 2u + e] * g;
+            }
+        }
+    }
+}
+
+/* Shared bytes a tiled-prefill launch needs: the two 16 KB tiles, plus the
+ * codebook when it is staged (CB 1). */
+static size_t pre_smem(const layout & L, int cb) {
+    return (size_t) (PRE_BM + PRE_BN) * PRE_BK * 2u + (cb ? (size_t) L.nc * L.dim * 2u : 0u);
+}
+
+/* Geometry the tiled kernel can take: a DQV3 payload (the round map reads the
+ * row-local stream; DQVQ numbers its bits across the whole matrix), dim 4 or 8
+ * (the 4-thread-per-row split assumes 2 or 4 code words each), a 12-bit main
+ * stream (nc >= 4096), whole 64-column rounds, and a row stream whose 4-byte
+ * loads are aligned (cols/64 whole implies it; the check is on the derived
+ * width, not on the caller's promise). */
+static int pre_ok(const layout & L) {
+    return L.v3 && (L.dim == 4 || L.dim == 8) && L.rows > 0 && L.cols > 0 && L.nbit >= 12
+        && L.cols % PRE_BK == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
+}
+
 /* Prefill: one thread per (row, token). The row's indices are staged in shared
  * memory once by the block, then every thread walks them, reading the codebook
  * (the same address across the block, so L1 broadcasts it) and its own token's
@@ -294,7 +509,7 @@ __global__ void gemv_v3blk_kernel(const uint8_t * p, const layout L, const float
  * The first version of this kernel indexed the activation buffer per row and
  * uncoalesced the reads by 8 KB; it ran at 6 tok/s. This shape is what the ds4
  * group kernel does with codeword-once-dot-per-token, transposed onto threads. */
-#define PRE_THREADS 256
+#define PRE_LEGACY_THREADS 256
 
 __global__ void gemm_prefill_kernel(const uint8_t * p, const layout L, const float * xT,
                                     int ntok, float * y) {
@@ -403,6 +618,34 @@ __global__ void gemv_f32_kernel(const float * w, const float * x, float * y, int
     if (threadIdx.x == 0) y[r] += red[0];
 }
 
+template <int CB, int DIM>
+static int pre_tiled(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y,
+                     int iters, double * ms) {
+    const size_t smem = pre_smem(L, CB);
+    if (cudaFuncSetAttribute(gemm_tiled_kernel<CB, DIM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) smem) != cudaSuccess)
+        return fail("prefill shared memory opt-in", cudaGetLastError());
+    const dim3 grid((unsigned) ((L.rows + PRE_BM - 1) / PRE_BM),
+                    (unsigned) ((ntok + PRE_BN - 1) / PRE_BN));
+    cudaEvent_t a, b;
+    if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess)
+        return fail("event create", cudaGetLastError());
+    float best = 1e30f;
+    for (int it = 0; it < iters; it++) {
+        cudaEventRecord(a);
+        gemm_tiled_kernel<CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
+        cudaEventRecord(b);
+        if (cudaEventSynchronize(b) != cudaSuccess) return fail("prefill launch", cudaGetLastError());
+        float t = 0;
+        cudaEventElapsedTime(&t, a, b);
+        if (t < best) best = t;
+    }
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    *ms = best;
+    return 0;
+}
+
 extern "C" {
 
 /* Largest dynamic shared-memory window the device accepts; the shared-codebook
@@ -502,23 +745,23 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
     return 0;
 }
 
-/* Prefill one stage: xT is [cols][ntok], y is [ntok][rows], both device-side. */
-int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3,
-                const float * xT, int ntok, float * y, int iters, double * ms) {
-    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+/* Prefill one stage, legacy shape: xT is [cols][ntok], y is [ntok][rows], both
+ * device-side. One thread per (row, token), no cross-thread reduction. */
+static int pre_legacy(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                      const float * xT, int ntok, float * y, int iters, double * ms) {
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const int smem = /* shared index staging */ (int) ((size_t) (cols / dim) * 2);
     if (smem > 48 * 1024 &&
         cudaFuncSetAttribute(gemm_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess)
         return fail("prefill shared memory opt-in", cudaGetLastError());
-    const dim3 grid(L.rows, (ntok + PRE_THREADS - 1) / PRE_THREADS);
+    const dim3 grid(L.rows, (ntok + PRE_LEGACY_THREADS - 1) / PRE_LEGACY_THREADS);
     cudaEvent_t a, b;
     if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess)
         return fail("event create", cudaGetLastError());
     float best = 1e30f;
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(a);
-        gemm_prefill_kernel<<<grid, PRE_THREADS, smem>>>((const uint8_t *) payload, L, xT, ntok, y);
+        gemm_prefill_kernel<<<grid, PRE_LEGACY_THREADS, smem>>>((const uint8_t *) payload, L, xT, ntok, y);
         cudaEventRecord(b);
         if (cudaEventSynchronize(b) != cudaSuccess) return fail("prefill launch", cudaGetLastError());
         float t = 0;
@@ -529,6 +772,46 @@ int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v
     cudaEventDestroy(b);
     *ms = best;
     return 0;
+}
+
+/* Whether a prefill path can run on this geometry:
+ *   0 = auto (the fastest one this geometry supports)
+ *   1 = tiled f16 mma, codebook through L1
+ *   2 = tiled f16 mma, codebook staged in shared (needs the opt-in window)
+ *   3 = legacy one-thread-per-(row, token) kernel (any geometry)
+ */
+int vqg_prefill_ready(int dim, int nc, int rows, int cols, int v3, int variant) {
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    switch (variant) {
+        case 0: return 1;
+        case 1: return pre_ok(L);
+        case 2: return pre_ok(L) && pre_smem(L, 1) <= smem_max();
+        case 3: return 1;
+        default: return 0;
+    }
+}
+
+/* Prefill one stage: xT is [cols][ntok], y is [ntok][rows], both device-side.
+ * `variant` selects the path (see vqg_prefill_ready); 0 picks the tiled kernel
+ * when the geometry allows it and the legacy kernel otherwise. */
+int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                const float * xT, int ntok, float * y, int iters, double * ms, int variant) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (ntok <= 0) { snprintf(g_err, sizeof g_err, "prefill needs at least one token"); return -1; }
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    const uint8_t * p = (const uint8_t *) payload;
+    if (variant == 0) variant = pre_ok(L) ? 1 : 3;
+    if (variant == 3 || !pre_ok(L)) return pre_legacy(payload, dim, nc, rows, cols, v3, xT, ntok, y, iters, ms);
+    if (variant == 2) {
+        if (pre_smem(L, 1) > smem_max()) { snprintf(g_err, sizeof g_err, "prefill codebook does not fit shared"); return -1; }
+        return L.dim == 4 ? pre_tiled<1, 4>(p, L, xT, ntok, y, iters, ms)
+                          : pre_tiled<1, 8>(p, L, xT, ntok, y, iters, ms);
+    }
+    if (variant == 1)
+        return L.dim == 4 ? pre_tiled<0, 4>(p, L, xT, ntok, y, iters, ms)
+                          : pre_tiled<0, 8>(p, L, xT, ntok, y, iters, ms);
+    snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
+    return -1;
 }
 
 int vqg_gemv_f32(const float * w, const float * x, float * y, int rows, int cols, int iters, double * ms) {

@@ -26,7 +26,15 @@ extern int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols
 extern int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * x, float * y, int variant, int iters, double * ms);
 extern int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant);
 extern int vqg_gemv_f32(const float * w, const float * x, float * y, int rows, int cols, int iters, double * ms);
-extern int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * xT, int ntok, float * y, int iters, double * ms);
+extern int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * xT, int ntok, float * y, int iters, double * ms, int variant);
+extern int vqg_prefill_ready(int dim, int nc, int rows, int cols, int v3, int variant);
+
+/* The prefill path a geometry gets when the caller asks for 0 (auto). */
+static int pick_prefill(int dim, int nc, int rows, int cols, int v3) {
+    if (vqg_prefill_ready(dim, nc, rows, cols, v3, 2)) return 2;
+    if (vqg_prefill_ready(dim, nc, rows, cols, v3, 1)) return 1;
+    return 3;
+}
 
 static uint8_t * slurp(const char * path, size_t * out_n) {
     FILE * f = fopen(path, "rb");
@@ -60,7 +68,7 @@ static int pick_variant(int dim, int nc, int rows, int cols, int v3) {
 /* Benchmark every matrix listed in <dir>/manifest.txt and report the decode
  * rate of the whole artifact: container bytes per second, and the modeled
  * tokens per second of the fused path (one pass over all weights per token). */
-static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long kvcache_bytes, int csv_only) {
+static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long kvcache_bytes, int csv_only, int prefill_variant) {
     char mpath[1024];
     snprintf(mpath, sizeof mpath, "%s/manifest.txt", dir);
     FILE * mf = fopen(mpath, "r");
@@ -70,6 +78,7 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
     size_t bytes = 0, weights = 0;
     int tensors = 0;
     int kv[4] = {0, 0, 0, 0};   /* tensors per fused variant, for the report */
+    int pv[4] = {0, 0, 0, 0};   /* tensors per prefill path, for the report */
     float * scratch = NULL;
     size_t scratch_bytes = 0;
     float * xT = NULL, * yT = NULL;
@@ -195,10 +204,13 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
                 yT_cap = needy;
             }
             cudaMemset(yT, 0, needy * 4);
+            const int pvf = prefill_variant ? prefill_variant
+                                            : pick_prefill(dim, nc, (int) rows, (int) cols, v3);
+            pv[pvf & 3]++;
             for (uint16_t s = 0; s < stages; s++) {
                 double ms = 0.0;
                 if (vqg_prefill(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3,
-                                xT, prefill_tok, yT, iters, &ms)) {
+                                xT, prefill_tok, yT, iters, &ms, pvf)) {
                     fprintf(stderr, "%s: prefill: %s\n", path, vqg_decode_error());
                     free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
                     return 1;
@@ -267,6 +279,15 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
            dequant_ms, (double) bytes / 1e9 / (dequant_ms * 1e-3));
     printf("decode rate %.1f tok/s (matrices only, batch 1)\n", 1000.0 / fused_ms);
     if (prefill_tok > 0) {
+        const char * pn[4] = {"auto", "tiled L1", "tiled smem", "legacy"};
+        int first = 1;
+        printf("prefill k   ");
+        for (int v = 0; v < 4; v++) {
+            if (!pv[v]) continue;
+            printf("%s%d %s", first ? "" : ", ", pv[v], pn[v]);
+            first = 0;
+        }
+        printf("\n");
         printf("prefill     %d tokens in %.3f ms, %.1f tok/s, %.2f GB/s of container\n",
                prefill_tok, prefill_ms,
                (double) prefill_tok * 1000.0 / prefill_ms,
@@ -282,14 +303,14 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
 int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "usage: %s <file.bin> [--iters N] [--check]\n"
-            "       %s --manifest <artifact-dir> [--iters N] [--prefill N] [--csv]\n"
+            "usage: %s <file.bin> [--iters N] [--check] [--prefill N [--prefill-variant V]]\n"
+            "       %s --manifest <artifact-dir> [--iters N] [--prefill N] [--prefill-variant V] [--csv]\n"
             "              [--ctx N] [--kv f16|q8_0] [--kvcache-bytes N]\n"
             "              [--layers N --full-layers N --kv-heads N --head-dim N]\n",
             argv[0], argv[0]);
         return 2;
     }
-    int iters = 20, check = 0, prefill_tok = 0, csv_only = 0;
+    int iters = 20, check = 0, prefill_tok = 0, csv_only = 0, prefill_variant = 0;
     int ctx = 131072, layers = 36, full_layers = 9, kv_heads = 4, head_dim = 256;
     int kv_q8 = 1;
     long long kvb_override = -1;
@@ -297,6 +318,7 @@ int main(int argc, char ** argv) {
         if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) prefill_tok = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefill-variant") && i + 1 < argc) prefill_variant = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--csv")) csv_only = 1;
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) kv_q8 = !strcmp(argv[++i], "q8_0");
@@ -317,7 +339,7 @@ int main(int argc, char ** argv) {
         kvcache_bytes = (long long) ((double) ctx * (double) full_layers * 2.0 * kv_heads * head_dim * elem
                                    + 512.0 * (double) (layers - full_layers) * 2.0 * kv_heads * head_dim * elem);
     }
-    if (!strcmp(argv[1], "--manifest")) return cmd_manifest(argv[2], iters, prefill_tok, kvcache_bytes, csv_only);
+    if (!strcmp(argv[1], "--manifest")) return cmd_manifest(argv[2], iters, prefill_tok, kvcache_bytes, csv_only, prefill_variant);
 
     size_t n = 0;
     uint8_t * buf = slurp(argv[1], &n);
@@ -459,6 +481,76 @@ int main(int argc, char ** argv) {
         }
         printf("check       maxabs %.6f, relL2 %.6f%% (fused vs host f64)\n", mx, 100.0 * sqrt(se / (sn + 1e-30)));
         free(w);
+    }
+
+    /* Prefill: a real token batch through the same weight path. The gate is a
+     * host f64 matvec of the dequantised matrix at five tokens spread across
+     * the first tile and the second block boundary, which is where a wrong
+     * row/token mapping would show up. */
+    if (prefill_tok > 0) {
+        const size_t nx = (size_t) cols * (size_t) prefill_tok;
+        const size_t ny = (size_t) rows * (size_t) prefill_tok;
+        float * hx = malloc(nx * 4), * xt = NULL, * yt = NULL;
+        if (!hx) return 1;
+        for (size_t i = 0; i < nx; i++) hx[i] = sinf((float) i * 0.0001f);
+        if (cuda_ok(cudaMalloc((void **) &xt, nx * 4), "cudaMalloc prefill x") ||
+            cuda_ok(cudaMalloc((void **) &yt, ny * 4), "cudaMalloc prefill y") ||
+            cuda_ok(cudaMemcpy(xt, hx, nx * 4, cudaMemcpyHostToDevice), "upload prefill x") ||
+            cuda_ok(cudaMemset(yt, 0, ny * 4), "zero prefill y")) return 1;
+        const int pv = prefill_variant ? prefill_variant
+                                       : pick_prefill(dim, nc, (int) rows, (int) cols, v3);
+        double pms = 0.0;
+        for (uint16_t s = 0; s < stages; s++) {
+            double ms = 0.0;
+            if (vqg_prefill(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3,
+                            xt, prefill_tok, yt, iters, &ms, pv)) {
+                fprintf(stderr, "prefill: %s\n", vqg_decode_error());
+                return 1;
+            }
+            pms += ms;
+        }
+        printf("prefill     %d tokens in %.4f ms, %.1f tok/s (path %d)\n",
+               prefill_tok, pms, (double) prefill_tok * 1000.0 / pms, pv);
+        if (check) {
+            /* The timing loop accumulates into y, so take one clean pass for
+             * the gate (same rule as the fused GEMV check above). */
+            if (cuda_ok(cudaMemset(yt, 0, ny * 4), "zero prefill y")) return 1;
+            for (uint16_t s = 0; s < stages; s++) {
+                double ms = 0.0;
+                if (vqg_prefill(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3,
+                                xt, prefill_tok, yt, 1, &ms, pv)) {
+                    fprintf(stderr, "prefill gate: %s\n", vqg_decode_error());
+                    return 1;
+                }
+            }
+            float * yh = malloc(ny * 4), * w = malloc((size_t) rows * cols * 4);
+            if (!yh || !w) return 1;
+            if (cuda_ok(cudaMemcpy(yh, yt, ny * 4, cudaMemcpyDeviceToHost), "download prefill y") ||
+                cuda_ok(cudaMemcpy(w, dw, (size_t) rows * cols * 4, cudaMemcpyDeviceToHost), "download w")) return 1;
+            const int ts[7] = {0, 1, 63, 64, 127, 128, 511};
+            double se = 0.0, sn = 0.0, mx = 0.0;
+            for (int k = 0; k < 7; k++) {
+                const int t = ts[k];
+                if (t >= prefill_tok) continue;
+                for (uint32_t r = 0; r < rows; r++) {
+                    const float * wr = w + (size_t) r * cols;
+                    double acc = 0.0;
+                    for (uint32_t c = 0; c < cols; c++)
+                        acc += (double) wr[c] * (double) hx[(size_t) c * (size_t) prefill_tok + (size_t) t];
+                    const double d = acc - (double) yh[(size_t) t * rows + r];
+                    se += d * d;
+                    sn += acc * acc;
+                    if (fabs(d) > mx) mx = fabs(d);
+                }
+            }
+            printf("prefill chk maxabs %.6f, relL2 %.6f%% (prefill vs host f64)\n",
+                   mx, 100.0 * sqrt(se / (sn + 1e-30)));
+            free(w);
+            free(yh);
+        }
+        free(hx);
+        cudaFree(xt);
+        cudaFree(yt);
     }
 
     free(y);

@@ -255,12 +255,14 @@ Three decoders read the same container, and the GPU one answers the speed
 question in one command:
 
     ./bin/decode-gpu --manifest models/vq-build-8192-2-v3 --iters 10
+    ./bin/decode-gpu --manifest models/vq-build-8192-2-v3 --iters 5 --prefill 512
 
 It sums the fused gather+dot over every matrix in the manifest and prints the
-container rate and the modeled tokens per second for matrix work at batch 1.
-The Rust harness prints the same numbers and names the kernel it chose:
+container rate and the modeled tokens per second for matrix work at batch 1;
+`--prefill N` adds an N-token GEMM through the same weight path. The Rust
+harness prints the same numbers and names the kernel and prefill path it chose:
 
-    ./bin/vq-bench models/vq-build-8192-2-v3 --iters 10
+    ./bin/vq-bench models/vq-build-8192-2-v3 --iters 10 [--prefill 512]
 
 Measured on the RTX 4070 SUPER, every artifact in the DQV3 row-local payload,
 one run on 2026-10-31:
@@ -305,12 +307,49 @@ A plain f32 GEMV on the same card reaches 470 GB/s, so the best VQ rate is
 about 70 percent of what this card demonstrably streams: the index gather and
 the plane shuffles are issue- and latency-bound before DRAM is saturated.
 
+## 8a. Measure the prefill (N tokens through the same weights)
+
+Prefill is a real GEMM over the decoded matrix, so it needs tiles: one block
+takes 128 weight rows x 128 tokens over all K, stepping 64 columns a round,
+16 warps, f16 tensor cores with f32 accumulate (ds4-dfm-rs
+`cuda/ds41_vq_prefill_mma.cuh:52-58`, `:82-94`, `:167-201`). The codebook is
+copied into the A tile as f16 with no conversion because the payload's
+codebook is already f16; the one named deviation from that reference is f16
+instead of bf16 products, since bf16 would round a 10-mantissa-bit codeword by
+2^-8 and ds4 only chose bf16 because its codebook is E4M3.
+
+Measured on the RTX 4070 SUPER, 4x8192 x2, one session on 2026-10-31:
+
+| tokens | prefill path | time | tok/s |
+|---:|---|---:|---:|
+| 128 | tiled f16, codebook in shared | 107.2 ms | 1193.8 |
+| 128 | tiled f16, codebook through L1 | 121.8 ms | 1051.2 |
+| 128 | legacy one-thread-per-(row,token) | 1569.96 ms | 81.5 |
+| 512 | tiled f16, codebook in shared | 293.8 ms | 1742.8 |
+| 512 | same, Rust harness | 269.9 ms | 1896.7 |
+
+4x4096 x3 at 512 tokens: 424.2 ms, 1207.0 tok/s. 4x1024 x1 falls back to the
+legacy path (its 10-bit stream is below the tiled kernel's 12-bit round map)
+and reaches 168.8 tok/s at 128 tokens. The tiled path is 14.6x the legacy one
+at 128 tokens, and token tiles run in parallel, so 512 tokens cost 2.7x the
+128-token time rather than 4x.
+
+`--prefill-variant` picks the path (0 auto, 1 tiled L1, 2 tiled shared,
+3 legacy); the report's `prefill k` line names what ran. Gate: a host f64
+matvec of the dequantised matrix at tokens 0, 1, 63, 64, 127, 128 and 511 (the
+tile boundary and the second block), which every shape above passes at
+relL2 0.0159 percent and maxabs 1.3e-3:
+
+    ./bin/decode-gpu <file.bin> --iters 3 --prefill 128 --check
+
 Two paths that are deliberately slower, both in the same binary:
 
 - dequant to f32 (`dequant` line): 136 ms for the whole artifact at 24.8 GB/s.
   This is the expand-once loader shape, and it is about 13x slower than fusing.
 - shared-memory codebook (variant 0): 38 GB/s; staging 64 KB per block costs
-  more than the L1 misses it saves.
+  more than the L1 misses it saves at batch 1. In prefill the same table in
+  shared is the faster choice (107 ms against 122 for 128 tokens), because a
+  block reuses every entry many times instead of once per row.
 
 Container checks, independent of the encoder's own bookkeeping:
 
@@ -319,17 +358,29 @@ Container checks, independent of the encoder's own bookkeeping:
     ./bin/decode dump   <file.bin> <out.f32>            # raw f32, for the Rust gate
     ./bin/dqvq check    <file.bin> <out.f32>            # Rust must match the C dump
     ./bin/decode-gpu    <file.bin> --check              # CUDA must match a host f64 matvec
+    ./bin/decode-gpu    <file.bin> --prefill 128 --check # the same for a token batch
 
 The C and Rust decoders are bit-exact against each other (26,214,400 of
-26,214,400 values on layer 0), checked on all three v3 shapes built here:
-dim 4 with 4096 and 8192 codewords, and dim 8 with 8192. The CUDA gate matches
-the host f64 matvec at maxabs 2e-6 on the same shapes.
+26,214,400 values on layer 0), checked on five payload shapes: dim 4 with 1024,
+4096 and 8192 codewords, dim 8 with 8192, and the DQVQ (v2) build of 8192. The
+CUDA gate matches the host f64 matvec at maxabs 2e-6 on the same shapes, and
+both CUDA prefill paths (tiled and legacy) match it at relL2 0.0159 percent.
 
-The 13-bit width is enforced, not just documented: DQV3 carries 12 bits in the
-row's main stream plus one in the plane, so nc above 8192 cannot be encoded.
-`build-vq-gpu` refuses such an encoding and all three decoders refuse such a
-container, instead of decoding the low 13 bits of a 14-bit index and returning
-wrong weights.
+Two widths are enforced, not just documented, because getting either wrong
+returns different weights with no error:
+
+- 13 bits per index. DQV3 carries 12 in the row's main stream plus one in the
+  plane, so nc above 8192 cannot be encoded. `build-vq-gpu` refuses such an
+  encoding and all three decoders refuse such a container, instead of decoding
+  the low 13 bits of a 14-bit index.
+- The main stream is min(bit width, 12) bits wide, not always 12. A 4096
+  codebook packs 12-bit slots, a 1024 one packs 10-bit slots and shorter rows.
+  All three decoders read a fixed 12 until 2026-10-31 and therefore decoded
+  every payload below nc 4096 at the wrong offsets (the CUDA shared-codebook
+  kernel even ran off the codebook and faulted). The width now comes from the
+  header. The block and tiled kernels are 12-bit by construction, so
+  `v3_blk_ok` and `pre_ok` refuse narrower streams and the generic kernels,
+  which read `rd_idx_fmt`, serve them.
 
 What these numbers are not: the matrix cost of one token with no attention, no
 KV read and no sampling. They are the decode rate of the VQ path, not a server

@@ -38,7 +38,7 @@ extern int vqg_train(const float * X, int nvec, int dim, int nc, int iters, floa
 extern int vqg_assign(const float * X, int nvec, int dim, const float * C, int nc, int * idx);
 extern const char * vqg_last_error(void);
 
-/* ---- DQV3 payload: row-local 12-bit main stream + 1-bit plane -------------
+/* ---- DQV3 payload: row-local main stream (min(bits, 12)) + 1-bit plane -------
  * Source of truth for the geometry: cuda/ds41_vq_row.cuh:7-20 and :122-137 in
  * ds4-dfm-rs. The main stream is always 12 bits and starts at a byte boundary
  * every row; widths above 12 carry the extra bit in a plane of
@@ -133,7 +133,7 @@ int main(int argc, char ** argv) {
     char * match[MAXMATCH]; int nmatch = 0;
     char * skip[MAXMATCH];  int nskip = 0;
     int no_embed = 0;
-    int fmt_v3 = 1;   /* DQV3 row-local 12-bit + plane; --format v2 writes DQVQ */
+    int fmt_v3 = 1;   /* DQV3 row-local stream + plane; --format v2 writes DQVQ */
     for (int i = 6; i < argc; i++) {
         if (!strcmp(argv[i], "--match") && i + 1 < argc && nmatch < MAXMATCH) match[nmatch++] = argv[++i];
         else if (!strcmp(argv[i], "--skip") && i + 1 < argc && nskip < MAXMATCH) skip[nskip++] = argv[++i];

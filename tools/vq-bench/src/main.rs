@@ -156,12 +156,21 @@ fn run(o: &Opt) -> Result<(), String> {
     let mut v3blk = 0usize;
     let mut fast = 0usize;
     let mut generic = 0usize;
+    let mut pre_tiled_smem = 0usize;
+    let mut pre_tiled_l1 = 0usize;
+    let mut pre_legacy = 0usize;
     for t in &m.tensors {
         let s = h.measure(t)?;
         match s.variant {
             3 => v3blk += 1,
             2 => fast += 1,
             _ => generic += 1,
+        }
+        match s.prefill_variant {
+            2 => pre_tiled_smem += 1,
+            1 => pre_tiled_l1 += 1,
+            3 => pre_legacy += 1,
+            _ => {}
         }
         r.tensors += 1;
         r.container_bytes += t.file_bytes;
@@ -206,6 +215,17 @@ fn run(o: &Opt) -> Result<(), String> {
         gb / (r.decode_ms * 1e-3)
     );
     if o.prefill > 0 {
+        let mut pp = Vec::new();
+        if pre_tiled_smem > 0 {
+            pp.push(format!("{pre_tiled_smem} tiled f16 smem"));
+        }
+        if pre_tiled_l1 > 0 {
+            pp.push(format!("{pre_tiled_l1} tiled f16 L1"));
+        }
+        if pre_legacy > 0 {
+            pp.push(format!("{pre_legacy} legacy (slow)"));
+        }
+        println!("prefill k   {}", pp.join(", "));
         println!(
             "prefill     {} tokens in {:.3} ms, {:.1} tok/s, {:.2} GB/s of container",
             o.prefill,

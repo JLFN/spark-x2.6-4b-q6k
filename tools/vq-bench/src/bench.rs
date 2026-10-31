@@ -13,7 +13,7 @@
 //! manifest and reused. Peak device use is reported, so a run that would not fit
 //! a card is visible before it starts.
 
-use crate::cuda::{vqg_dequant, vqg_gemv, vqg_prefill, DevBuf};
+use crate::cuda::{vqg_dequant, vqg_gemv, vqg_prefill, vqg_prefill_ready, DevBuf};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -187,6 +187,19 @@ impl Harness {
             decode_ms += ms;
         }
 
+        /* Prefill path this geometry supports: the tiled f16-mma kernel with the
+         * codebook staged in shared when it fits, else with it in L1, else the
+         * legacy per-(row, token) kernel. Named in the report so a slow number
+         * is not read as the format's. */
+        let pv = if self.prefill > 0 {
+            let ok = |v: i32| unsafe {
+                vqg_prefill_ready(dim, nc, rows, cols, v3 as i32, v) != 0
+            };
+            if ok(2) { 2 } else if ok(1) { 1 } else { 3 }
+        } else {
+            0
+        };
+
         let mut prefill_ms = 0.0f64;
         if self.prefill > 0 {
             for s in 0..t.stages as usize {
@@ -204,6 +217,7 @@ impl Harness {
                         self.yt.ptr() as *mut f32,
                         self.iters as i32,
                         &mut ms,
+                        pv,
                     )
                 };
                 if rc != 0 {
@@ -244,6 +258,7 @@ impl Harness {
             prefill_ms,
             dequant_ms,
             variant,
+            prefill_variant: pv,
         })
     }
 }
@@ -254,6 +269,9 @@ pub struct Sample {
     pub dequant_ms: f64,
     /// Kernel used for the fused GEMV: 2 = dim-4 fast path, 1 = generic warp.
     pub variant: i32,
+    /// Prefill path: 2 = tiled f16 mma with the codebook in shared, 1 = tiled
+    /// with it in L1, 3 = legacy one-thread-per-(row, token) kernel.
+    pub prefill_variant: i32,
 }
 
 /// Aggregate over the whole artifact, in the ds4-bench column order.

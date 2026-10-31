@@ -39,6 +39,10 @@ extern "C" {
         iters: i32,
         ms: *mut f64,
     ) -> i32;
+    /// Whether a prefill path can run on this geometry (0 = auto, 1 = tiled
+    /// f16 mma with the codebook in L1, 2 = tiled with the codebook in shared,
+    /// 3 = legacy one-thread-per-(row, token)).
+    pub fn vqg_prefill_ready(dim: i32, nc: i32, rows: i32, cols: i32, v3: i32, variant: i32) -> i32;
     /// Prefill of `ntok` tokens; xT is [cols][ntok], y is [ntok][rows].
     pub fn vqg_prefill(
         payload: *const c_void,
@@ -52,6 +56,7 @@ extern "C" {
         y: *mut f32,
         iters: i32,
         ms: *mut f64,
+        variant: i32,
     ) -> i32;
     /// Dequantise one stage into an f32 matrix (accumulates).
     pub fn vqg_dequant(
