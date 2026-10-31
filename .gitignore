@@ -12,3 +12,6 @@ models/server-*.log
 
 # graphify-rs output
 graphify-out/
+
+# locally built helper binaries
+bin/

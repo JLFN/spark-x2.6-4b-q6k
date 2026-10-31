@@ -84,6 +84,13 @@ reproduce the loop.
 ## Layout
 
     RECIPE.md         the recipe and the record: pins, type choice, commands, gate, release plan
+    RECIPE-VQ.md      the dense-VQ investigation, its measurements, and what a VQ run would need
+    THIRD_PARTY.md    provenance and licenses for the vendored VQ encoder
+    tools/vq/         the dense-VQ encoder, vendored and buildable here
+      build.sh                builds bin/eg2_vq and bin/quant_err
+      eg2_vq.c                the encoder (copy of the EmbeddingGemma tool)
+      quant_err.c             llama.cpp k-quant error on one HF matrix
+      vendor/                 YoungAi VQ headers, MIT, pinned
     models/           the artifacts, the source checkpoint, logs, checksums, run script
       spark26-4b-Q6_K.gguf    3.46 GB, the artifact
       spark26-4b-bf16.gguf    8.22 GB, the gate reference (not for publishing)
