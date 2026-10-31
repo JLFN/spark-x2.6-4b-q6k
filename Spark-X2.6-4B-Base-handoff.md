@@ -1,8 +1,8 @@
 # Spark-X2.6-4B-Base — session handoff
 
 Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
-carries this handoff (docs(handoff): the runtime gate), and origin/master is one
-commit behind it until the push is approved. The working tree is clean once that
+carries this handoff (docs(handoff): the GPU model runtime), and origin/master
+is behind it until the push is approved. The working tree is clean once that
 commit exists.
 
 Everything below was run in this repository; nothing is a plan dressed as a
@@ -30,6 +30,14 @@ result. Where a number is missing it says so.
   llama.cpp's top-20 next tokens in the same order, with log-softmax values
   within 0.011, and every VQ point loads and runs with argmax agreement. It is
   reference speed, not a fast runtime: 2.7-2.9 tok/s with 16.1 GB resident.
+- GPU VQ runtime: bin/vq-model-gpu keeps the containers on the device and runs
+  the same forward pass there, every matrix through the fused DQV3 block GEMV.
+  It is gated against the CPU reference (section 2): identical generated ids,
+  logit relL2 0.000027% at 5 tokens and 0.000863% over 600 tokens (which
+  crosses the sliding window), argmax agreement everywhere. Decode is 70.8-71.8
+  tok/s at ctx 512 on 4x8192 x2, 24x the reference. The prompt path is the
+  per-token GEMV path; the measured tiled prefill is not wired into the model
+  runtime yet.
 
 ## 2. Measurements (do not re-derive)
 
@@ -88,6 +96,35 @@ The distribution numbers are one prompt and one position. They prove the
 loader and the forward pass are right and show the order of magnitude; they
 are not a perplexity or KL benchmark over text.
 
+GPU model runtime gate, 2026-10-31, same prompt, GPU logits against the CPU
+reference's logits (both artifacts, bin/logits-diff):
+
+    4x8192 x2, 5 tokens     argmax 19500 both, relL2 0.000027%, maxabs 1.9e-5,
+                            cosine 1.0, top-100 100/100, KL 0 both directions
+    4x4096 x3, 5 tokens     argmax 19500 both, relL2 0.000028%, maxabs 2.1e-5,
+                            top-25 25/25
+    4x8192 x2, 600 tokens   argmax 1046 both, relL2 0.000863%, maxabs 9.2e-4,
+                            top-25 25/25
+    generated ids, 8        19500, 27, 614, 11862, 314, 17349, 390, 19500
+                            on both runtimes
+    load                    0.7 s for 3.37 GB (page-cached); 7.42 GB free of
+                            12.47 GB after load
+    decode, ctx 512, gen 64 70.84 / 71.25 / 71.80 tok/s (three runs) against
+                            2.97 tok/s for the CPU reference
+
+The 600-token prompt matters: it is the only row where positions exceed the
+512-token sliding window, so the start index, the mask and rope far from 0 are
+exercised. The small drift (0.0009% against 0.00003%) is accumulation order,
+three orders of magnitude below the quantization effect the gate exists to
+see. 71 tok/s is about 74 percent of the artifact-only block-kernel rate
+measured in the same session (10.321 ms/token, 326.96 GB/s, 96.9 tok/s
+matrix-only; section 2's 10.84 ms is an earlier session and the rate drifts);
+the remainder is 218 launches per token, attention, the norms and one device
+sync per token.
+
+Not measured: the GPU runtime's prompt rate with the tiled prefill, because
+that kernel is not wired into the model loop yet.
+
 Kernel on one matrix (layer 0 down_proj, dim 4 / 8192 / 2), one run:
 
     DQV3 block kernel     0.0717 ms   299 GB/s
@@ -132,23 +169,27 @@ dim 8 with 8192, and the DQVQ build of 8192):
 
 ## 4. Open work, in priority order
 
-1. GPU model runtime. This is now the top item: the CPU reference is committed
-   and gated, and it streams 16.45 GB of f32 weight per token, so 2.7-2.9 tok/s
-   is its ceiling and no further CPU tuning will move it. The measured kernels
-   in bin/decode-gpu (block GEMV at 299 GB/s, tiled prefill at 1742-1897 tok/s)
-   are the pieces a model-level runtime needs. Acceptance: at the gate prompt,
-   the same ids and logits as the CPU reference within kernel precision, then
-   the decode rate.
+1. Tiled prefill in the GPU model runtime. The model now decodes at 71 tok/s
+   (done and gated), but it processes a prompt one token at a time, so prompt
+   ingestion is 15 ms/token where the measured tiled kernel takes about
+   0.3 ms/token of matrix work (1742-1897 tok/s). The work is: keep the layer
+   input as [cols][ntok] for the tiled kernel, which writes y as [ntok][rows]
+   instead of accumulating into one vector; add a batched causal attention
+   kernel over the ntok new positions and the cache; add the per-token residual
+   after each projection tile; and give rope each token's own position.
+   Acceptance: on a multi-token prompt, the same logits as the current
+   token-by-token path within kernel precision, then the prompt rate. This is
+   the only remaining speed item before DSpark is worth wiring.
 2. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
    DSpark is this model's MTP equivalent and it is already wired on the
    llama.cpp path (measured 1.13-1.40x there), but it is not wired into the VQ
-   runtime and should not be until item 1 makes the base fast enough for
-   speculation to pay. When it is taken up, the work is: expose target hidden
-   states at five layers, load the draft GGUF, implement the 5-block SWA
-   dflash graph with attn_gate and gelu, then the propose/verify loop.
-   Acceptance against a VQ target is unmeasured and must be measured, because
-   the draft was trained on bf16 hidden states and VQ shifts them (manifest
-   relL2 about 2.8-3.4 per tensor).
+   runtime and should not be until item 1 makes prompt handling fast and the
+   base runtime is past 71 tok/s. When it is taken up, the work is: expose
+   target hidden states at five layers, load the draft GGUF, implement the
+   5-block SWA dflash graph with attn_gate and gelu, then the propose/verify
+   loop. Acceptance against a VQ target is unmeasured and must be measured,
+   because the draft was trained on bf16 hidden states and VQ shifts them
+   (manifest relL2 about 2.8-3.4 per tensor).
 
 Why "add MTP" is not an option, checked 2026-10-31: the released checkpoint has
 no MTP layers. model.safetensors.index.json has no mtp or nextn tensors,
@@ -162,10 +203,11 @@ EAGLE-style pattern, a separate 624 M draft fed by target features, not an
 in-checkpoint MTP head. Anything called "fixing MTP" would mean training a
 new module, not repairing one.
 
-3. Prefill tuning, only if a runtime needs it. The B-tile load reads xT
-   column-major and writes shared token-major (4-way bank conflict on a path
-   that is a minor share of the traffic); a 256-token tile would halve the
-   A-tile decode per token if shared memory allowed it.
+3. Prefill micro-tuning, only after item 1 shows the integrated kernel's
+   number. The B-tile load reads xT column-major and writes shared token-major
+   (4-way bank conflict on a path that is a minor share of the traffic); a
+   256-token tile would halve the A-tile decode per token if shared memory
+   allowed it.
 4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
    also lose both fast kernels, so expect the per-index rates.
 
@@ -182,7 +224,9 @@ new module, not repairing one.
     ./bin/vq-bench compare a.csv b.csv
     ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/hf.f32
     ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/logits-diff /tmp/hf.f32 /tmp/vq.f32 --top 20
+    ./bin/logits-diff /tmp/vq.f32 /tmp/gpu.f32 --top 20   # GPU against the CPU reference
     ./bin/build-vq-gpu models/hf <out> 4 8192 2   # DQV3 by default, ~4 min
 
 ## 6. Traps
@@ -221,3 +265,14 @@ new module, not repairing one.
   number, not the first prompt rate of the first run.
 - The Q6_K Base checkpoint loops under greedy chat decoding; that is the BASE
   model, not damage. Send temperature 0.8-1.0 and always send max_tokens.
+- vq-model-gpu has no prefill path: it runs a prompt token by token, so its
+  prompt rate equals its decode rate (about 66-71 tok/s). Do not read that as
+  a prefill number; the tiled kernel is not wired in yet (section 4, item 1).
+- vq-model-gpu allocates the KV cache from --ctx at startup, and its default is
+  4096 (about 1.2 GB of device memory). A prompt longer than --ctx exits with
+  "position N exceeds the M-token cache", which is the intended error, not a
+  crash. The gate runs used 512 and 1024.
+- The GPU runtime picks each tensor's GEMV variant at load with
+  vqg_gemv_ready (block kernel, else dim-4 warp, else generic warp). A payload
+  that cannot take the block kernel therefore still runs, just slower; that is
+  deliberate, not a silent specialization to one artifact point.
