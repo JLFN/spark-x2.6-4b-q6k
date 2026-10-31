@@ -99,11 +99,18 @@ int main(int argc, char ** argv) {
         const uint8_t * raw = v41_st_data(&S, E);
         if (E->nd != 2) {
             float * v = malloc(n * 4);
+            if (!v) { fprintf(stderr, "%s: out of memory\n", E->name); fclose(f); remove(path); return 1; }
             for (size_t k = 0; k < n; k++) v[k] = ds4_bf16_to_f32(((const uint16_t *) raw)[k]);
-            fwrite("RQVF", 1, 4, f);
             uint32_t rows = (uint32_t) n, cols = 1;
-            fwrite(&rows, 4, 1, f); fwrite(&cols, 4, 1, f);
-            fwrite(v, 4, n, f);
+            size_t want = 12 + 4 * n, got = 0;
+            got += fwrite("RQVF", 1, 4, f);
+            got += fwrite(&rows, 4, 1, f) * 4;
+            got += fwrite(&cols, 4, 1, f) * 4;
+            got += fwrite(v, 4, n, f) * 4;
+            if (got != want) {
+                fprintf(stderr, "%s: short write, %zu of %zu bytes (out of space?)\n", E->name, got, want);
+                fclose(f); remove(path); free(v); return 1;
+            }
             fprintf(mf, "%s %zu 1 0 %zu -1\n", E->name, n, 12 + 4 * n);
             fclose(f); free(v);
             continue;
@@ -114,6 +121,7 @@ int main(int argc, char ** argv) {
         const size_t nvec = n / (size_t) dim;
 
         float * W = malloc(n * 4);
+        if (!W) { fprintf(stderr, "%s: out of memory\n", E->name); fclose(f); remove(path); return 1; }
         for (size_t k = 0; k < n; k++) W[k] = ds4_bf16_to_f32(((const uint16_t *) raw)[k]);
 
         /* Residual stages, as bin/rvq does on the CPU: each stage trains on the
@@ -166,8 +174,14 @@ int main(int argc, char ** argv) {
         memcpy(hdr + 12, &rows, 4); memcpy(hdr + 16, &cols, 4);
         uint64_t psz64 = (uint64_t) psz * (uint64_t) stages;
         memcpy(hdr + 24, &psz64, 8);
-        fwrite(hdr, 1, 32, f);
-        fwrite(buf, 1, psz * (size_t) stages, f);
+        const size_t payload = psz * (size_t) stages;
+        size_t written = fwrite(hdr, 1, 32, f);
+        written += fwrite(buf, 1, payload, f);
+        if (written != 32 + payload) {
+            fprintf(stderr, "%s: short write, %zu of %zu bytes (out of space?)\n",
+                    E->name, written, 32 + payload);
+            fclose(f); remove(path); return 1;
+        }
 
         /* relL2 of the final residual, so the manifest carries quality. */
         double se = 0, sn = 0;

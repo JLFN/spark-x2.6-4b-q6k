@@ -4,11 +4,12 @@ models/hf/
 models/dspark/*.gguf
 models/dspark/*.log
 models/instruct/*.gguf
-models/vq-build/
-models/vq-build-gpu/
+models/vq-build*/
 
 # build scratch
 out/build/
+out/*.f32
+out/vq-*/
 models/server.log
 models/server-*.log
 

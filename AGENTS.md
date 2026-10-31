@@ -249,7 +249,54 @@ Expected for the shipped dim 4 / 1024 / 1-stage artifact: 290 tensors, 0
 mismatches, 1,290,051,957 bytes. For the 4x8192 x2 checkpoint: 290 tensors, 0
 mismatches, 3,375,234,666 bytes.
 
-## 8. Pitfalls that cost time here
+## 8. Measure the decode rate (VQ only)
+
+Three decoders read the same container, and the GPU one answers the speed
+question in one command:
+
+    ./bin/decode-gpu --manifest models/vq-build-8192-2 --iters 5
+
+It sums the fused gather+dot over every matrix in the manifest and prints the
+container rate and the modeled tokens per second for matrix work at batch 1.
+Measured on the RTX 4070 SUPER, best of five:
+
+| Artifact | container | bpw | fused ms/token | GB/s | tok/s |
+|---|---:|---:|---:|---:|---:|
+| 4x1024 x1 | 1.289 GB | 2.51 | 5.064 | 254.6 | 197.5 |
+| 4x8192 x2 | 3.375 GB | 6.57 | 10.266 | 328.7 | 97.4 |
+| 4x4096 x3 | 4.655 GB | 9.06 | 16.196 | 287.4 | 61.7 |
+
+Decode time tracks container bytes almost exactly, so quality is bought with
+decode time in direct proportion. The kernel matters: the first warp-per-row
+version ran at 107 GB/s and 36.7 tok/s, and the current one reaches 329 GB/s by
+loading one 8-byte `uint2` codebook entry per index, converting with
+`__half22float2`, and unrolling four indices deep. A plain f32 GEMV on the same
+card reaches 470 GB/s, so the gather still costs about 30 percent of bandwidth.
+
+Two paths that are deliberately slower, both in the same binary:
+
+- dequant to f32 (`dequant` line): 136 ms for the whole artifact at 24.8 GB/s.
+  This is the expand-once loader shape, and it is 13x slower than fusing.
+- shared-memory codebook (variant 0): 38 GB/s; staging 64 KB per block costs
+  more than the L1 misses it saves.
+
+Container checks, independent of the encoder's own bookkeeping:
+
+    ./bin/decode info   <file.bin>                      # header, layout, consistency
+    ./bin/decode check  <file.bin> models/hf <tensor>   # relL2 against the checkpoint
+    ./bin/decode dump   <file.bin> <out.f32>            # raw f32, for the Rust gate
+    ./bin/dqvq check    <file.bin> <out.f32>            # Rust must match the C dump
+    ./bin/decode-gpu    <file.bin> --check              # CUDA must match a host f64 matvec
+
+The C and Rust decoders are bit-exact against each other (26,214,400 of
+26,214,400 values on layer 0). The CUDA gate matches the host f64 matvec at
+maxabs 3e-6.
+
+What these numbers are not: the matrix cost of one token with no attention, no
+KV read and no sampling. They are the decode rate of the VQ path, not a server
+throughput claim.
+
+## 9. Pitfalls that cost time here
 
 - Do not trust a hardcoded context. `config.json` says 1,048,576; the repo serves
   131,072 because a GQA cache for 1M is 19,613 MiB at q8_0 on a 12,282 MiB card.
@@ -266,12 +313,16 @@ mismatches, 3,375,234,666 bytes.
   BASE checkpoint, not damage: BF16 loops identically. Send temperature 0.8-1.0
   and always send max_tokens.
 
-## 9. File map
+## 10. File map
 
     RECIPE.md          the Q6_K build record and the release plan
     RECIPE-VQ.md       the VQ investigation: measurements, GPU path, calibration map
     RECIPE-DOMAIN.md   the ds4 domain-sidecar mechanism and what Spark would need
     tools/vq/          encoder, residuals, planner, builders (CPU and GPU)
+    tools/vq/decode.c  C reference decoder: info, check, dump, matvec
+    tools/vq/decode-rs/ Rust decoder and fused GEMV, no crates (bin/dqvq)
+    tools/vq/gpu/decode-gpu.cu  CUDA decode and GEMV kernels
+    tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)

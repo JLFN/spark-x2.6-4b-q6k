@@ -35,6 +35,22 @@ echo "built $ROOT/bin/plan"
 $CC $CFLAGS $VQ_INC -o "$ROOT/bin/build-vq" "$ROOT/tools/vq/build-vq.c" -lm
 echo "built $ROOT/bin/build-vq"
 
+# Reference decoder: reads an RQVQ container and the HF checkpoint, nothing else.
+# -ffp-contract=off keeps the accumulate in two roundings, which is what the Rust
+# port does by default; without it GCC fuses into FMA and the two decoders differ
+# in the last bit on about one value in a thousand.
+$CC $CFLAGS -ffp-contract=off $VQ_INC -o "$ROOT/bin/decode" "$ROOT/tools/vq/decode.c" -lm
+echo "built $ROOT/bin/decode"
+
+# Rust decoder and decode bench: same container, same semantics, no crates.
+RUSTC=${RUSTC:-rustc}
+if command -v "$RUSTC" >/dev/null 2>&1; then
+  "$RUSTC" -O -C target-cpu=native -o "$ROOT/bin/dqvq" "$ROOT/tools/vq/decode-rs/decode.rs"
+  echo "built $ROOT/bin/dqvq"
+else
+  echo "skipped dqvq: $RUSTC not found"
+fi
+
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
   "$ROOT/tools/vq/quant_err.c" "$ROOT/tools/kquant/stubs.c" "$OBJ/ggml-quants.o" -lm
@@ -49,6 +65,13 @@ if [ -x "$NVCC" ]; then
     "$ROOT/tools/vq/gpu/build-vq-gpu.c" "$OBJ/vq_gpu.o" -lm -lstdc++ -L/usr/local/cuda/lib64 -lcudart \
     -Wl,-rpath,/usr/local/cuda/lib64
   echo "built $ROOT/bin/build-vq-gpu"
+
+  # CUDA decoder and decode-speed bench: one container, fused GEMV and dequant.
+  $NVCC -O3 -std=c++17 -arch=sm_$ARCH -c -o "$OBJ/decode_gpu.o" "$ROOT/tools/vq/gpu/decode-gpu.cu"
+  $CC $CFLAGS $VQ_INC -I/usr/local/cuda/include -o "$ROOT/bin/decode-gpu" \
+    "$ROOT/tools/vq/gpu/decode-gpu.c" "$OBJ/decode_gpu.o" -lm -lstdc++ -L/usr/local/cuda/lib64 -lcudart \
+    -Wl,-rpath,/usr/local/cuda/lib64
+  echo "built $ROOT/bin/decode-gpu"
 else
   echo "skipped build-vq-gpu: $NVCC not found"
 fi
