@@ -1,11 +1,9 @@
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD is 71b6428 and
-origin/master is at the same commit. The working tree is NOT clean:
-tools/vq-format/ and tools/vq-runtime/ are new and uncommitted, and
-tools/Cargo.toml, tools/Cargo.lock and tools/dqvq/src/main.rs are modified.
-They are the CPU f32 reference runtime, which builds but was not gated,
-committed or timed before this handoff.
+Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
+carries this handoff (docs(handoff): the runtime gate), and origin/master is one
+commit behind it until the push is approved. The working tree is clean once that
+commit exists.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -26,11 +24,12 @@ result. Where a number is missing it says so.
 - Prefill is MEASURED now: 512 tokens in 293.8 ms (1742.8 tok/s) in the C
   driver and 269.9 ms (1896.7 tok/s) in the Rust harness, on the tiled f16
   kernel. The legacy kernel is 14.6x slower on the same bytes.
-- VQ runtime: a CPU f32 reference now exists in the working tree (uncommitted:
-  tools/vq-format, tools/vq-runtime). It loads the bf16 checkpoint or an RQVQ
-  artifact and runs a full forward pass over token ids, but it is a reference,
-  not a fast runtime: it streams f32 weights per token and has not been gated
-  or timed.
+- VQ runtime: tools/vq-runtime is a CPU f32 reference that loads either the
+  bf16 checkpoint or an RQVQ artifact and runs the full Spark2_5 forward pass
+  over token ids. It is gated (numbers in section 2): on bf16 it reproduces
+  llama.cpp's top-20 next tokens in the same order, with log-softmax values
+  within 0.011, and every VQ point loads and runs with argmax agreement. It is
+  reference speed, not a fast runtime: 2.7-2.9 tok/s with 16.1 GB resident.
 
 ## 2. Measurements (do not re-derive)
 
@@ -70,6 +69,24 @@ Prefill, 4x8192 x2, one session on 2026-10-31, whole artifact:
 The 4x1024 x1 artifact cannot take the tiled path: its stream is 10-bit and
 the round map is 12-bit, so vqg_prefill_ready refuses it and the legacy kernel
 runs. That is the correct outcome, not a regression.
+
+Runtime gate, 2026-10-31, prompt [1046, 11862, 314, 17349, 390] ("The capital
+of France is", 5 tokens, ids from llama.cpp /tokenize with add_special false),
+greedy:
+
+    forward vs llama.cpp bf16   top-20 ids identical and in the same order,
+                                log-softmax within 0.011 (19500: -0.8606
+                                against -0.8592)
+    4x8192 x2 vs bf16            argmax 19500 both, logit relL2 11.52%,
+                                 cosine 0.99896, KL 0.42 nats, top-10 5/10
+    4x4096 x3 vs bf16            argmax 19500 both, logit relL2 9.51%,
+                                 cosine 0.99915, KL 0.38 nats, top-10 6/10
+    load                        28.9 s bf16, 20.6 s 4x8192 x2, 16.1 GB RSS
+    steady state, 32 tokens     2.72 tok/s bf16, 2.78 tok/s VQ
+
+The distribution numbers are one prompt and one position. They prove the
+loader and the forward pass are right and show the order of magnitude; they
+are not a perplexity or KL benchmark over text.
 
 Kernel on one matrix (layer 0 down_proj, dim 4 / 8192 / 2), one run:
 
@@ -115,20 +132,17 @@ dim 8 with 8192, and the DQVQ build of 8192):
 
 ## 4. Open work, in priority order
 
-1. Commit the VQ reference runtime. tools/vq-format and tools/vq-runtime are
-   uncommitted and nothing in them has been gated. The gate: C decode equals
-   Rust decode (already exact), then vq-runtime logits against the bf16
-   checkpoint at a fixed prompt, then a timing run. No runtime speed should be
-   quoted before that run exists.
-2. GPU model runtime. The CPU f32 reference streams about 16.45 GB per token,
-   which caps it near 3-4 tok/s on realistic CPU bandwidth. The measured
-   kernels in bin/decode-gpu (block GEMV at 299 GB/s, tiled prefill at
-   1742-1897 tok/s) are the pieces a model-level runtime needs; wiring them is
-   the real speed step.
-3. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
+1. GPU model runtime. This is now the top item: the CPU reference is committed
+   and gated, and it streams 16.45 GB of f32 weight per token, so 2.7-2.9 tok/s
+   is its ceiling and no further CPU tuning will move it. The measured kernels
+   in bin/decode-gpu (block GEMV at 299 GB/s, tiled prefill at 1742-1897 tok/s)
+   are the pieces a model-level runtime needs. Acceptance: at the gate prompt,
+   the same ids and logits as the CPU reference within kernel precision, then
+   the decode rate.
+2. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
    DSpark is this model's MTP equivalent and it is already wired on the
    llama.cpp path (measured 1.13-1.40x there), but it is not wired into the VQ
-   runtime and should not be until item 2 makes the base fast enough for
+   runtime and should not be until item 1 makes the base fast enough for
    speculation to pay. When it is taken up, the work is: expose target hidden
    states at five layers, load the draft GGUF, implement the 5-block SWA
    dflash graph with attn_gate and gelu, then the propose/verify loop.
@@ -148,11 +162,11 @@ EAGLE-style pattern, a separate 624 M draft fed by target features, not an
 in-checkpoint MTP head. Anything called "fixing MTP" would mean training a
 new module, not repairing one.
 
-4. Prefill tuning, only if a runtime needs it. The B-tile load reads xT
+3. Prefill tuning, only if a runtime needs it. The B-tile load reads xT
    column-major and writes shared token-major (4-way bank conflict on a path
    that is a minor share of the traffic); a 256-token tile would halve the
    A-tile decode per token if shared memory allowed it.
-5. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
+4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
    also lose both fast kernels, so expect the per-index rates.
 
 ## 5. Resume
@@ -166,6 +180,9 @@ new module, not repairing one.
     ./bin/decode-gpu <file.bin> --prefill 128 --check [--prefill-variant 0..3]
     ./bin/vq-bench models/vq-build-8192-2-v3 --iters 10 [--prefill 512] [--csv]
     ./bin/vq-bench compare a.csv b.csv
+    ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/hf.f32
+    ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
+    ./bin/logits-diff /tmp/hf.f32 /tmp/vq.f32 --top 20
     ./bin/build-vq-gpu models/hf <out> 4 8192 2   # DQV3 by default, ~4 min
 
 ## 6. Traps
@@ -193,5 +210,14 @@ new module, not repairing one.
   112) decodes subnormals one binade low; vq_fmt.h:22-28 and dqvq use 113.
 - Two llama-server instances do not fit on this card; one at 128K q8_0 plus the
   draft is about 8.8 GB of 12.3 GB.
+- vq-runtime takes token ids, never text, so the logits gate only means
+  anything if both implementations see the same ids: tokenize with llama.cpp's
+  own /tokenize (add_special false) and pass that list, or the prompts differ
+  by a BOS and the comparison is void. The server reports tokens_evaluated;
+  check it equals the id count.
+- A run that has just loaded 7.7 GB of weights reports a slow prompt rate: the
+  same 5-token prompt measured 1.57 tok/s cold and 2.78 tok/s warm on
+  2026-10-31. Quote the generated rate of a 32-token run as the steady-state
+  number, not the first prompt rate of the first run.
 - The Q6_K Base checkpoint loops under greedy chat decoding; that is the BASE
   model, not damage. Send temperature 0.8-1.0 and always send max_tokens.
