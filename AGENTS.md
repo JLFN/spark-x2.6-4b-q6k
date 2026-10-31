@@ -17,8 +17,9 @@ Two artifact families live here and they are not the same thing:
 - VQ weights (per-tensor containers under `models/vq-build*`). Two runtimes
   read and run them: the CPU f32 reference (tools/vq-runtime) and the
   whole-model GPU runtime (tools/vq/gpu/vq-model-gpu.cu). Both are in section
-  8b; the GPU one is gated against the CPU reference and is about 24x faster
-  (71 tok/s against 2.97 at the 4x8192 x2 point).
+  8b; the GPU one is gated against the CPU reference, decodes at 71 tok/s
+  (24x the reference at the 4x8192 x2 point) and ingests a prompt at about
+  850 tok/s through the tiled prefill.
 
 Know which one a request is about before acting.
 
@@ -459,9 +460,34 @@ entries. 71 tok/s is 24x the CPU reference on the same artifact and about 74
 percent of the artifact-only block-kernel rate measured in the same session
 (10.32 ms/token, 96.9 tok/s matrix-only; the section 8 figure drifts between
 sessions); the rest is 218 kernel launches, the attention, the norms and one
-device sync per token. The tiled prefill kernel is measured but NOT wired into the model
-runtime: the prompt goes through the same per-token GEMV path, which is why
-the prompt rate equals the generation rate.
+device sync per token.
+
+The tiled prefill is now wired into the model runtime's prompt path. The
+prompt runs in chunks of up to 512 tokens through the tiled f16 mma kernel,
+with batched causal attention over each token's own window, rope at each
+token's absolute position and the same f32 residual stream. Gated against the
+token-by-token path on the same binary with bin/logits-diff:
+
+| comparison | result |
+|---|---|
+| 4x8192 x2, 5 tokens | argmax 19500 both; relL2 0.005455%, maxabs 4.9e-3, top-100 100/100, KL 0 both |
+| 4x8192 x2, 600 tokens | argmax 1046 both; relL2 0.1501%, maxabs 0.169, top-25 25/25, top-100 99/100, KL 1e-6 |
+| 4x4096 x3, 5 tokens | argmax 19500 both; relL2 0.009183%, maxabs 5.5e-3, top-25 25/25 |
+| chunking | 600 tokens as 512+88 and as one chunk are bit-identical (relL2 0) |
+| generated ids, 8 | identical to the token-by-token path on both artifacts |
+| prompt rate | 128 tokens 851 tok/s (token path 66), 512 tokens 868 (62), 600 tokens 798-834 (62) |
+
+The 0.0055-0.15% spread is the f16 activation conversion inside the tiled mma
+kernel, not a logic difference: the token path itself matches the CPU f32
+reference to 0.000027% at 5 tokens and 0.000863% at 600, and tiled against the
+CPU at 5 tokens is 0.005458%, the same number as tiled against token. Prompt
+ingestion is about half the artifact-only tiled rate (1743 tok/s at 512); the
+rest is the batched attention, four transposes per layer, the norms and 512
+embedding row dequeues, which is the micro-tuning target rather than a
+correctness gap. An artifact with any matrix whose geometry the tiled kernel
+cannot take (4x1024 x1 has a 10-bit stream) runs the prompt token by token and
+prints that it does. `--no-prefill` forces the token-by-token path and
+`--chunk N` sets the chunk size.
 
 ## 9. Pitfalls that cost time here
 
