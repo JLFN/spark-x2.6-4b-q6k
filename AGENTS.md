@@ -14,9 +14,11 @@ Two artifact families live here and they are not the same thing:
 
 - GGUF k-quants (`models/spark26-4b-Q6_K.gguf`, plus Q5_K and Q4_K builds). These
   run in llama.cpp today and are what the server scripts use.
-- VQ weights (per-tensor containers under `models/vq-build*`). A CPU f32
-  reference runtime reads and runs them (tools/vq-runtime, section 8b). It is
-  correct but reference-grade speed, and no fast VQ runtime exists yet.
+- VQ weights (per-tensor containers under `models/vq-build*`). Two runtimes
+  read and run them: the CPU f32 reference (tools/vq-runtime) and the
+  whole-model GPU runtime (tools/vq/gpu/vq-model-gpu.cu). Both are in section
+  8b; the GPU one is gated against the CPU reference and is about 24x faster
+  (71 tok/s against 2.97 at the 4x8192 x2 point).
 
 Know which one a request is about before acting.
 
@@ -28,7 +30,8 @@ Builds `bin/eg2_vq`, `bin/rvq`, `bin/plan`, `bin/quant_err`, `bin/build-vq`
 (CPU) and, when `nvcc` is present at /usr/local/cuda-13.3/bin/nvcc,
 `bin/build-vq-gpu`. Nothing is read from outside the repository except the CUDA
 toolkit and the checkpoint itself. The cargo workspace adds `bin/dqvq`,
-`bin/vq-bench`, `bin/vq-runtime` and `bin/logits-diff`.
+`bin/vq-bench`, `bin/vq-runtime` and `bin/logits-diff`; the GPU block adds
+`bin/decode-gpu` and `bin/vq-model-gpu`.
 
 Runtimes are separate: `./tools/runtime/build-runtime.sh` clones and builds the
 two pinned llama.cpp trees into `vendor/` (gitignored).
@@ -427,8 +430,38 @@ higher-bitrate point is closer on every metric.
 
 What these numbers are not: a perplexity or a full-text KL. They are one
 prompt, one position, and greedy continuation. The 2.7-2.9 tok/s is the f32
-reference streaming 16.45 GB per token; the block GEMV and the tiled prefill in
-section 8 are what a fast runtime would use instead.
+reference streaming 16.45 GB per token.
+
+`bin/vq-model-gpu` is the model-level GPU runtime. It loads the same artifact,
+keeps every container on the device, and runs the whole forward pass there:
+the fused DQV3 block GEMV (section 8) for every matrix, with rmsnorm (f64
+accumulation like the reference), rope, GQA attention with the sliding window,
+the per-head sigmoid gate, the exact erf gelu and the tied head as kernels in
+tools/vq/gpu/vq-model-gpu.cu. Same ids, same --logits:
+
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids "$IDS" --gen 64 --ctx 512 --logits /tmp/gpu.f32
+    ./bin/logits-diff /tmp/vq.f32 /tmp/gpu.f32 --top 20
+
+The CPU reference is its acceptance test. Measured 2026-10-31:
+
+| comparison | result |
+|---|---|
+| 4x8192 x2, GPU vs CPU reference, 5 tokens | argmax 19500 both; logit relL2 0.000027%, maxabs 1.9e-5, top-100 100/100 |
+| 4x4096 x3, GPU vs CPU reference, 5 tokens | argmax 19500 both; logit relL2 0.000028%, maxabs 2.1e-5, top-25 25/25 |
+| 4x8192 x2, GPU vs CPU, 600 tokens | argmax both; relL2 0.000863%, maxabs 9.2e-4, top-25 25/25 |
+| generated ids, 8 tokens | identical on both: 19500, 27, 614, 11862, 314, 17349, 390, 19500 |
+| load | 0.7 s for 3.37 GB (page-cached); 7.42 GB free of 12.47 GB after load |
+| decode rate, ctx 512, 64 generated tokens | 70.8-71.8 tok/s (13.9-14.1 ms/token), three runs |
+
+The 600-token row is the one that exercises the sliding mask (positions past
+512) and rope far from 0; the 5-token rows only see the first few cache
+entries. 71 tok/s is 24x the CPU reference on the same artifact and about 74
+percent of the artifact-only block-kernel rate measured in the same session
+(10.32 ms/token, 96.9 tok/s matrix-only; the section 8 figure drifts between
+sessions); the rest is 218 kernel launches, the attention, the norms and one
+device sync per token. The tiled prefill kernel is measured but NOT wired into the model
+runtime: the prompt goes through the same per-token GEMV path, which is why
+the prompt rate equals the generation rate.
 
 ## 9. Pitfalls that cost time here
 
@@ -457,8 +490,9 @@ section 8 are what a fast runtime would use instead.
     tools/vq-format/   the one container decoder, linked by dqvq and the runtime
     tools/dqvq/        CLI over vq-format: info, check, gemv (bin/dqvq)
     tools/vq-runtime/  CPU f32 reference runtime and logits-diff (sections 8b)
-    tools/vq/gpu/decode-gpu.cu  CUDA decode and GEMV kernels
+    tools/vq/gpu/decode-gpu.cu  CUDA decode, GEMV, tiled prefill kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
+    tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)

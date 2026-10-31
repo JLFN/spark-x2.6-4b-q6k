@@ -674,6 +674,32 @@ int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant) {
     }
 }
 
+/* One fused GEMV launch, no events and no synchronization. The model runtime
+ * issues a chain of these per token and synchronizes once, so the chain costs
+ * one sync, not one per matrix. variant 0 picks the fastest kernel the
+ * geometry supports; the shared-codebook variant is not offered here because
+ * it needs its dynamic shared-memory opt-in before the loop starts. */
+static int gemv_launch(const uint8_t * p, const layout & L, const float * x, float * y, int variant) {
+    const int threads = 256;
+    if (variant == 0) variant = v3_blk_ok(L) ? 3 : (L.dim == 4 ? 2 : 1);
+    const int blocks = (L.rows * 32 + threads - 1) / threads;
+    if (variant == 3) {
+        if (!v3_blk_ok(L)) { snprintf(g_err, sizeof g_err, "the DQV3 block kernel does not take this geometry"); return -1; }
+        if (L.dim == 4) {
+            if (L.prow) gemv_v3blk_kernel<4, 1><<<blocks, threads>>>(p, L, x, y);
+            else        gemv_v3blk_kernel<4, 0><<<blocks, threads>>>(p, L, x, y);
+        } else {
+            if (L.prow) gemv_v3blk_kernel<0, 1><<<blocks, threads>>>(p, L, x, y);
+            else        gemv_v3blk_kernel<0, 0><<<blocks, threads>>>(p, L, x, y);
+        }
+    } else if (variant == 2 && L.dim == 4) {
+        gemv_warp4_kernel<<<blocks, threads>>>(p, L, x, y);
+    } else {
+        gemv_warp_kernel<<<blocks, threads>>>(p, L, x, y);
+    }
+    return 0;
+}
+
 /* Decode one stage into out (device pointer), then optionally time `iters`
  * repeated launches. Returns the elapsed milliseconds of the best iteration. */
 int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
@@ -722,17 +748,7 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(a);
         if (variant == 0)      gemv_kernel<<<blocks, threads, smem>>>((const uint8_t *) payload, L, x, y);
-        else if (variant == 3 && v3_blk_ok(L)) {
-            if (L.dim == 4) {
-                if (L.prow) gemv_v3blk_kernel<4, 1><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
-                else        gemv_v3blk_kernel<4, 0><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
-            } else {
-                if (L.prow) gemv_v3blk_kernel<0, 1><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
-                else        gemv_v3blk_kernel<0, 0><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
-            }
-        }
-        else if (variant == 2 && L.dim == 4) gemv_warp4_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
-        else                   gemv_warp_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
+        else if (gemv_launch((const uint8_t *) payload, L, x, y, variant)) return -1;
         cudaEventRecord(b);
         if (cudaEventSynchronize(b) != cudaSuccess) return fail("gemv launch", cudaGetLastError());
         float t = 0;
@@ -742,6 +758,43 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
     cudaEventDestroy(a);
     cudaEventDestroy(b);
     *ms = best;
+    return 0;
+}
+
+/* One GEMV launch for a caller that already checked the geometry, with no
+ * timing and no synchronization (see gemv_launch). variant 0 = auto. */
+int vqg_gemv_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                    const float * x, float * y, int variant) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "gemv needs a non-empty matrix"); return -1; }
+    return gemv_launch((const uint8_t *) payload, make_layout(dim, nc, rows, cols, v3), x, y, variant);
+}
+
+/* Rebuild one row of one stage into out (device pointer, accumulated). The
+ * model runtime needs exactly this for the token embedding: the tied
+ * embedding matrix is a VQ container too, and expanding it to f32 would cost
+ * 1.3 GB of device memory for rows it will never read. */
+__global__ void row_dequant_kernel(const uint8_t * p, const layout L, int row, float * out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= L.cols / L.dim) return;
+    const __half * cb = (const __half *) (p + L.cb_off);
+    const __half * gr = (const __half *) (p + L.gain_off);
+    const uint8_t * st = p + L.stream_off;
+    const uint32_t v = rd_idx_fmt(st, L, (size_t) row, (size_t) i);
+    const float g = __half2float(gr[row]);
+    const __half * c = cb + (size_t) v * L.dim;
+    float * o = out + (size_t) i * L.dim;
+    for (int d = 0; d < L.dim; d++) o[d] += __half2float(c[d]) * g;
+}
+
+int vqg_row_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                    int row, float * out) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    if (row < 0 || row >= L.rows) { snprintf(g_err, sizeof g_err, "row %d is outside %d", row, L.rows); return -1; }
+    const int threads = 256;
+    const int blocks = (int) (((L.cols / L.dim) + threads - 1) / threads);
+    row_dequant_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, row, out);
     return 0;
 }
 

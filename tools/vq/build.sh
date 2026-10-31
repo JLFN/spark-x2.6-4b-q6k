@@ -78,6 +78,12 @@ if [ -x "$NVCC" ]; then
     "$ROOT/tools/vq/gpu/decode-gpu.c" "$OBJ/decode_gpu.o" -lm -lstdc++ -L/usr/local/cuda/lib64 -lcudart \
     -Wl,-rpath,/usr/local/cuda/lib64
   echo "built $ROOT/bin/decode-gpu"
+
+  # Whole-model GPU runtime: the same object's fused GEMV, plus the model's
+  # norms, rope, attention, gate and MLP kernels.
+  $NVCC -O3 -std=c++17 -arch=sm_$ARCH -o "$ROOT/bin/vq-model-gpu" \
+    "$ROOT/tools/vq/gpu/vq-model-gpu.cu" "$OBJ/decode_gpu.o" -lm
+  echo "built $ROOT/bin/vq-model-gpu"
 else
   echo "skipped build-vq-gpu and decode-gpu: $NVCC not found"
 fi

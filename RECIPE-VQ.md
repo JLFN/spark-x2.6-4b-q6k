@@ -1,12 +1,14 @@
 # Recipe: a VQ build of Spark-X2.6-4B
 
-Status: encoder in-repo and working; a CPU f32 reference runtime loads and runs
-the artifacts and is gated against the bf16 checkpoint and against llama.cpp
-(section 8, item 2, and AGENTS.md section 8b). The measurements below are the
-reason the next step is a decision, not a build order, and the runtime did not
-change the verdict on rate. AGENTS.md section 5 carries the fuller sweep, the
-whole-checkpoint builds and the whole-model k-quant comparison measured after
-this file was written.
+Status: encoder in-repo and working; two runtimes load and run the artifacts.
+The CPU f32 reference is gated against the bf16 checkpoint and against
+llama.cpp, and the GPU model runtime is gated against that reference; it
+decodes at 71 tok/s on 4x8192 x2, 24x the reference (section 8, item 2, and
+AGENTS.md section 8b). The measurements below are the reason the next step is
+a decision, not a build order, and the runtime did not change the verdict on
+quality. AGENTS.md section 5 carries the fuller sweep, the whole-checkpoint
+builds and the whole-model k-quant comparison measured after this file was
+written.
 
 ## 1. Verdict first
 
@@ -307,7 +309,17 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    bf16, 4x8192 x2 keeps the argmax with logit relL2 11.52% and KL 0.42 nats,
    and 4x4096 x3 is closer at 9.51% and 0.38. It is a reference, not a speed
    path: 16.45 GB of f32 weights per token, 2.7-2.9 tok/s, 16.1 GB resident.
-   The speed gap is unchanged:
+   A second runtime, tools/vq/gpu/vq-model-gpu.cu, runs the whole forward
+   pass on the GPU over the same artifact and is gated against the reference:
+   at the same prompt the logits agree to relL2 0.000027% (maxabs 1.9e-5,
+   top-100 100/100) and the 8 generated ids are identical; over a 600-token
+   prompt, which exercises the sliding window past position 512, relL2 is
+   0.000863% with the same argmax. It decodes at 70.8-71.8 tok/s (13.9-14.1
+   ms/token) at ctx 512 on 4x8192 x2, 24x the CPU reference and about 74
+   percent of the artifact-only block-kernel rate measured in the same session
+   (10.32 ms/token). The prompt still goes through the
+   per-token GEMV path; the measured tiled prefill kernel is not wired in yet.
+   The speed gap against llama.cpp is unchanged:
    - llama.cpp, which runs Spark today, has no codebook type at all: its ftypes
      are F16, Q4_0, Q4_1, Q8_0, Q5_0, Q5_1, Q2_K..Q6_K (include/llama.h:120).
      A VQ Spark on llama.cpp means a new ggml type plus a CUDA GEMV/GEMM path for
@@ -316,9 +328,10 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
      spark2_5 returns nothing, and the gemma_vq path is an embedding-only tower.
      This route means a full Spark2_5 family port into ds4.
    What the reference runtime did settle: the container, the decoder and a
-   correct forward pass are no longer open questions. What remains is speed,
-   and the pieces for it are measured inside this repo (block GEMV at 299 GB/s,
-   tiled prefill at 1742-1897 tok/s, tools/vq/gpu/decode-gpu.cu).
+   correct forward pass are no longer open questions. The block GEMV is now
+   wired into the GPU model runtime (299 GB/s, 71 tok/s end to end); the
+   remaining speed piece is the tiled prefill (1742-1897 tok/s on matrix
+   work), which is measured but not yet part of the model runtime.
 
 3. MTP / DSpark on top. The draft model reads target hidden states at layers
    2, 10, 18, 25 and 33. Weight format does not matter to the draft; what matters
