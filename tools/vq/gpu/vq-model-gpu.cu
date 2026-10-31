@@ -56,6 +56,9 @@ int vqg_gemv_launch(const void * payload, int dim, int nc, int rows, int cols, i
 int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant);
 int vqg_row_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
                     int row, float * out);
+int vqg_prefill_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                       const float * xT, int ntok, float * y, int variant);
+int vqg_prefill_ready(int dim, int nc, int rows, int cols, int v3, int variant);
 }
 
 /* ---------------------------------------------------------------- config -- */
@@ -198,7 +201,7 @@ static int parse_config(const char * path, Cfg * c) {
 /* --------------------------------------------------------------- weights -- */
 
 typedef struct {
-    int dim, nc, rows, cols, v3, nst, variant;
+    int dim, nc, rows, cols, v3, nst, variant, pvariant;
     unsigned char * st[4];
 } Mat;
 
@@ -265,6 +268,12 @@ static int load_mat(const char * dir, const char * name, int want_rows, int want
     }
     m->variant = vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, 3) ? 3
                 : vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, 2) ? 2 : 1;
+    /* The prefill path has its own geometry rules (a DQV3 12-bit stream and
+     * whole 64-column rounds), so it is chosen independently of the GEMV
+     * variant; 3 means the legacy batched kernel, which the model runtime
+     * treats as "token by token is better for this matrix". */
+    m->pvariant = vqg_prefill_ready(dim, nc, (int) rows, (int) cols, v3, 2) ? 2
+                : vqg_prefill_ready(dim, nc, (int) rows, (int) cols, v3, 1) ? 1 : 3;
     g_container_bytes += payload;
     free(buf);
     return 0;
@@ -430,6 +439,134 @@ __global__ void argmax_kernel(const float * v, int n, int * out) {
     if (t == 0) *out = bi[0];
 }
 
+/* ------- batched prompt kernels: the same arithmetic, one block per token --- */
+
+/* The same f64-accumulating norm as rmsnorm_kernel, one block per token, so
+ * the prompt path does not launch 36*2*ntok single-token norms. */
+__global__ void rmsnorm_batch_kernel(const float * x, const float * w, float * out,
+                                     int n, float eps) {
+    __shared__ double ss[256];
+    const int t = threadIdx.x;
+    const float * xr = x + (size_t) blockIdx.x * n;
+    float * orow = out + (size_t) blockIdx.x * n;
+    double s = 0.0;
+    for (int i = t; i < n; i += blockDim.x) s += (double) xr[i] * (double) xr[i];
+    ss[t] = s;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (t < off) ss[t] += ss[t + off];
+        __syncthreads();
+    }
+    const float inv = (float) (1.0 / sqrt(ss[0] / (double) n + (double) eps));
+    for (int i = t; i < n; i += blockDim.x) orow[i] = xr[i] * inv * w[i];
+}
+
+/* Token-major [rows][cols] -> column-major [cols][rows], which is the shape
+ * the tiled prefill reads. 32x32 tiles keep both sides coalesced. */
+__global__ void transpose_f32_kernel(const float * in, float * out, int rows, int cols) {
+    __shared__ float tile[32][33];
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+    if (x < cols && y < rows) tile[threadIdx.y][threadIdx.x] = in[(size_t) y * cols + x];
+    __syncthreads();
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+    if (x < rows && y < cols) out[(size_t) y * rows + x] = tile[threadIdx.x][threadIdx.y];
+}
+
+/* rope over every token of the chunk; each token's own absolute position
+ * feeds the same interleaved-half rotation as rope_kernel. */
+__global__ void rope_batch_kernel(float * qkv, int qkv_w, int qd, int heads, int kv_heads,
+                                  int hd, int pdim, double theta, int t0) {
+    const int half = pdim / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (heads + kv_heads) * half) return;
+    const int h = idx / half, i = idx % half;
+    const int pos = t0 + (int) blockIdx.y;
+    const double freq = 1.0 / pow(theta, 2.0 * (double) i / (double) pdim);
+    const double a = (double) pos * freq;
+    const float c = (float) cos(a), s = (float) sin(a);
+    float * row = qkv + (size_t) blockIdx.y * qkv_w;
+    float * base = (h < heads) ? row + (size_t) h * hd : row + qd + (size_t) (h - heads) * hd;
+    const float x0 = base[i], x1 = base[i + half];
+    base[i] = x0 * c - x1 * s;
+    base[i + half] = x1 * c + x0 * s;
+}
+
+__global__ void kv_store_batch_kernel(const float * qkv, int qkv_w, int qd, int kvd,
+                                      float * kc, float * vc, int t0) {
+    const int pos = t0 + (int) blockIdx.y;
+    const float * row = qkv + (size_t) blockIdx.y * qkv_w;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < kvd; i += blockDim.x * gridDim.x) {
+        kc[(size_t) pos * kvd + i] = row[qd + i];
+        vc[(size_t) pos * kvd + i] = row[qd + kvd + i];
+    }
+}
+
+/* One block per (head, token). Each block answers its own token's causal
+ * range, so the whole chunk's queries run in one launch; the cache already
+ * holds every key and value the block can see (all kv stores precede this
+ * launch). Shared layout: 256 reduction floats, then the score row. */
+__global__ void attn_batch_kernel(const float * qkv, int qkv_w, int qd, int kvd,
+                                  const float * gate, const float * kc, const float * vc,
+                                  int t0, int window, int full, int heads, int kv_heads,
+                                  int hd, float * out) {
+    extern __shared__ float sh[];
+    float * red = sh;
+    float * sc = sh + 256;
+    const int h = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int t = threadIdx.x;
+    const int pos = t0 + tok;
+    const int start = full ? 0 : (pos + 1 > window ? pos + 1 - window : 0);
+    const int n = pos + 1 - start;
+    const int kvh = h * kv_heads / heads;
+    const float * q = qkv + (size_t) tok * qkv_w + (size_t) h * hd;
+    const float * kb = kc + (size_t) start * kvd + (size_t) kvh * hd;
+    const float scale = 1.0f / sqrtf((float) hd);
+
+    for (int j = t; j < n; j += blockDim.x) {
+        const float * k = kb + (size_t) j * kvd;
+        float s = 0.0f;
+        for (int d = 0; d < hd; d++) s += q[d] * k[d];
+        sc[j] = s * scale;
+    }
+    __syncthreads();
+
+    float mx = -INFINITY;
+    for (int j = t; j < n; j += blockDim.x) mx = fmaxf(mx, sc[j]);
+    if (t < 256) red[t] = mx;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (t < off && t < 256) red[t] = fmaxf(red[t], red[t + off]);
+        __syncthreads();
+    }
+    mx = red[0];
+    __syncthreads();
+
+    float sm = 0.0f;
+    for (int j = t; j < n; j += blockDim.x) {
+        const float e = expf(sc[j] - mx);
+        sc[j] = e;
+        sm += e;
+    }
+    if (t < 256) red[t] = sm;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (t < off && t < 256) red[t] += red[t + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    const float g = 1.0f / (1.0f + expf(-gate[(size_t) tok * heads + h]));
+    const float * vb = vc + (size_t) start * kvd + (size_t) kvh * hd;
+
+    for (int d = t; d < hd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int j = 0; j < n; j++) o += sc[j] * inv * vb[(size_t) j * kvd + d];
+        out[(size_t) tok * qd + (size_t) h * hd + d] = o * g;
+    }
+}
+
 /* ----------------------------------------------------------------- model -- */
 
 typedef struct {
@@ -440,6 +577,10 @@ typedef struct {
     float * kv_k, * kv_v;
     int ctx;
     float * h, * xn, * qkv, * g16, * attn, * mlp_g, * mlp_u, * act, * logits;
+    /* Prompt chunk buffers, sized by m->chunk; hb is [chunk][hidden],
+     * xT is [hidden][chunk], and every other batch buffer is [chunk][rows]. */
+    int chunk, prefill_ok;
+    float * hb, * xb, * xT, * qkv_b, * g_b, * attn_b, * attn_t, * mlp_gb, * mlp_ub, * act_b, * act_t;
 } Model;
 
 static float * dev_f32(size_t n) {
@@ -461,9 +602,10 @@ static int gemv(const Mat * m, const float * x, float * y) {
     return 0;
 }
 
-static int alloc_model(Model * m, const Cfg * c, int ctx) {
+static int alloc_model(Model * m, const Cfg * c, int ctx, int chunk) {
     m->c = *c;
     m->ctx = ctx;
+    m->chunk = chunk;
     m->layers = (Layer *) calloc((size_t) c->layers, sizeof(Layer));
     if (!m->layers) return -1;
     /* The KV cache is position-major: [layer][pos][kv_dim], f32, both k and v. */
@@ -479,12 +621,27 @@ static int alloc_model(Model * m, const Cfg * c, int ctx) {
     m->mlp_u = dev_f32((size_t) c->inter);
     m->act = dev_f32((size_t) c->inter);
     m->logits = dev_f32((size_t) c->vocab);
+    const size_t nt = (size_t) chunk;
+    m->hb = dev_f32(nt * (size_t) c->hidden);
+    m->xb = dev_f32(nt * (size_t) c->hidden);
+    m->xT = dev_f32(nt * (size_t) c->hidden);
+    m->qkv_b = dev_f32(nt * (size_t) (c->q_dim + 2 * c->kv_dim));
+    m->g_b = dev_f32(nt * (size_t) c->heads);
+    m->attn_b = dev_f32(nt * (size_t) c->q_dim);
+    m->attn_t = dev_f32(nt * (size_t) c->q_dim);
+    m->mlp_gb = dev_f32(nt * (size_t) c->inter);
+    m->mlp_ub = dev_f32(nt * (size_t) c->inter);
+    m->act_b = dev_f32(nt * (size_t) c->inter);
+    m->act_t = dev_f32(nt * (size_t) c->inter);
     return (m->kv_k && m->kv_v && m->h && m->xn && m->qkv && m->g16 && m->attn &&
-            m->mlp_g && m->mlp_u && m->act && m->logits) ? 0 : -1;
+            m->mlp_g && m->mlp_u && m->act && m->logits && m->hb && m->xb && m->xT &&
+            m->qkv_b && m->g_b && m->attn_b && m->attn_t && m->mlp_gb && m->mlp_ub &&
+            m->act_b && m->act_t) ? 0 : -1;
 }
 
 static int load_model(Model * m, const char * dir) {
     const Cfg * c = &m->c;
+    m->prefill_ok = 1;
     if (load_mat(dir, "model.embedding.weight", c->vocab, c->hidden, &m->embed)) return -1;
     m->d_norm = load_vec(dir, "model.norm.weight", c->hidden);
     if (!m->d_norm) return -1;
@@ -505,6 +662,13 @@ static int load_model(Model * m, const char * dir) {
         if (!(L->in_norm = load_vec(dir, name, c->hidden))) return -1;
         snprintf(name, sizeof name, "model.layers.%d.post_attention_layernorm.weight", li);
         if (!(L->post_norm = load_vec(dir, name, c->hidden))) return -1;
+        /* One matrix whose geometry the tiled kernel cannot take makes the
+         * whole prompt fall back to the token-by-token path: the legacy
+         * batched kernel is slower than decode for such a matrix, and mixing
+         * it with tiled stages would only be a partial win. */
+        if (L->qkv.pvariant > 2 || L->attn_gate.pvariant > 2 || L->out.pvariant > 2 ||
+            L->gate.pvariant > 2 || L->up.pvariant > 2 || L->down.pvariant > 2)
+            m->prefill_ok = 0;
     }
     return 0;
 }
@@ -573,6 +737,107 @@ static int forward(Model * m, uint32_t token, int pos) {
     return 0;
 }
 
+/* One matrix times a chunk of tokens, every stage accumulated into y[ntok][rows]. */
+static int prefill_mat(const Mat * m, const float * xT, int ntok, float * y) {
+    for (int s = 0; s < m->nst; s++) {
+        if (vqg_prefill_launch(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3,
+                               xT, ntok, y, m->pvariant)) {
+            fprintf(stderr, "prefill: %s\n", vqg_decode_error());
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The forward pass for `ntok` prompt tokens starting at position t0. The
+ * activations stay token-major ([ntok][cols]) except where the tiled prefill
+ * requires [cols][ntok]; the two transposes per layer are the price of using
+ * that kernel without changing its layout contract. No logits are produced:
+ * the caller runs the final norm and tied head on the last row. */
+static int forward_batch(Model * m, const uint32_t * ids, int t0, int ntok) {
+    const Cfg * c = &m->c;
+    if (ntok <= 0 || ntok > m->chunk) {
+        fprintf(stderr, "a chunk of %d tokens does not fit the %d-token buffer\n", ntok, m->chunk);
+        return -1;
+    }
+    if (t0 < 0 || t0 + ntok > m->ctx) {
+        fprintf(stderr, "positions %d..%d exceed the %d-token cache\n", t0, t0 + ntok - 1, m->ctx);
+        return -1;
+    }
+    for (int t = 0; t < ntok; t++)
+        if ((int) ids[t] >= c->vocab) { fprintf(stderr, "token %u is outside the vocabulary\n", ids[t]); return -1; }
+
+    if (ck(cudaMemsetAsync(m->hb, 0, (size_t) ntok * c->hidden * 4), "memset hb")) return -1;
+    for (int t = 0; t < ntok; t++) {
+        for (int s = 0; s < m->embed.nst; s++) {
+            if (vqg_row_dequant(m->embed.st[s], m->embed.dim, m->embed.nc, m->embed.rows,
+                                m->embed.cols, m->embed.v3, (int) ids[t],
+                                m->hb + (size_t) t * c->hidden)) {
+                fprintf(stderr, "embedding row: %s\n", vqg_decode_error());
+                return -1;
+            }
+        }
+    }
+
+    const int qkv_w = c->q_dim + 2 * c->kv_dim;
+    for (int li = 0; li < c->layers; li++) {
+        Layer * L = &m->layers[li];
+        const int full = c->full[li];
+
+        rmsnorm_batch_kernel<<<ntok, 256>>>(m->hb, L->in_norm, m->xb, c->hidden, c->eps);
+        transpose_f32_kernel<<<dim3((c->hidden + 31) / 32, (ntok + 31) / 32), dim3(32, 32)>>>(
+            m->xb, m->xT, ntok, c->hidden);
+        if (ck(cudaMemsetAsync(m->qkv_b, 0, (size_t) ntok * qkv_w * 4), "memset qkv batch")) return -1;
+        if (prefill_mat(&L->qkv, m->xT, ntok, m->qkv_b)) return -1;
+        if (ck(cudaMemsetAsync(m->g_b, 0, (size_t) ntok * c->heads * 4), "memset gate batch")) return -1;
+        if (prefill_mat(&L->attn_gate, m->xT, ntok, m->g_b)) return -1;
+
+        const double theta = full ? c->rope_full_theta : c->rope_slide_theta;
+        const double partial = full ? c->rope_full_partial : c->rope_slide_partial;
+        int pdim = (int) ((double) c->head_dim * partial);
+        if (pdim > c->head_dim) pdim = c->head_dim;
+        if (pdim < 2) pdim = 2;
+        const int rot = (c->heads + c->kv_heads) * (pdim / 2);
+        rope_batch_kernel<<<dim3((rot + 127) / 128, ntok), 128>>>(
+            m->qkv_b, qkv_w, c->q_dim, c->heads, c->kv_heads, c->head_dim, pdim, theta, t0);
+
+        const size_t kv_off = (size_t) li * (size_t) m->ctx * (size_t) c->kv_dim;
+        kv_store_batch_kernel<<<dim3((c->kv_dim + 255) / 256, ntok), 256>>>(
+            m->qkv_b, qkv_w, c->q_dim, c->kv_dim, m->kv_k + kv_off, m->kv_v + kv_off, t0);
+
+        const int nmax = full ? (t0 + ntok)
+                             : ((t0 + ntok) > c->window ? c->window : (t0 + ntok));
+        const size_t sh = ((size_t) nmax + 256) * sizeof(float);
+        attn_batch_kernel<<<dim3(c->heads, ntok), 256, sh>>>(
+            m->qkv_b, qkv_w, c->q_dim, c->kv_dim, m->g_b, m->kv_k + kv_off, m->kv_v + kv_off,
+            t0, c->window, full, c->heads, c->kv_heads, c->head_dim, m->attn_b);
+        transpose_f32_kernel<<<dim3((c->q_dim + 31) / 32, (ntok + 31) / 32), dim3(32, 32)>>>(
+            m->attn_b, m->attn_t, ntok, c->q_dim);
+        if (prefill_mat(&L->out, m->attn_t, ntok, m->hb)) return -1;
+
+        rmsnorm_batch_kernel<<<ntok, 256>>>(m->hb, L->post_norm, m->xb, c->hidden, c->eps);
+        transpose_f32_kernel<<<dim3((c->hidden + 31) / 32, (ntok + 31) / 32), dim3(32, 32)>>>(
+            m->xb, m->xT, ntok, c->hidden);
+        if (ck(cudaMemsetAsync(m->mlp_gb, 0, (size_t) ntok * c->inter * 4), "memset mlp gate batch")) return -1;
+        if (ck(cudaMemsetAsync(m->mlp_ub, 0, (size_t) ntok * c->inter * 4), "memset mlp up batch")) return -1;
+        if (prefill_mat(&L->gate, m->xT, ntok, m->mlp_gb)) return -1;
+        if (prefill_mat(&L->up, m->xT, ntok, m->mlp_ub)) return -1;
+        const int els = ntok * c->inter;
+        gelu_mul_kernel<<<(els + 255) / 256, 256>>>(m->mlp_gb, m->mlp_ub, m->act_b, els);
+        transpose_f32_kernel<<<dim3((c->inter + 31) / 32, (ntok + 31) / 32), dim3(32, 32)>>>(
+            m->act_b, m->act_t, ntok, c->inter);
+        if (prefill_mat(&L->down, m->act_t, ntok, m->hb)) return -1;
+    }
+    return 0;
+}
+
+/* The tail of the prompt: the final norm and the tied head on one row. */
+static int tail_logits(Model * m, const float * h_last) {
+    rmsnorm_kernel<<<1, 256>>>(h_last, m->d_norm, m->xn, m->c.hidden, m->c.eps);
+    if (ck(cudaMemsetAsync(m->logits, 0, (size_t) m->c.vocab * 4), "memset logits")) return -1;
+    return gemv(&m->embed, m->xn, m->logits);
+}
+
 static int argmax_dev(const Model * m) {
     int * d = NULL;
     if (ck(cudaMalloc((void **) &d, 4), "cudaMalloc argmax")) return -1;
@@ -591,6 +856,8 @@ static const char * USAGE =
     "  --ids LIST        comma or space separated prompt token ids\n"
     "  --gen N           greedy continuation length (default 0)\n"
     "  --ctx N           KV cache size in tokens (default 4096)\n"
+    "  --chunk N         prompt tokens per prefill launch (default 512)\n"
+    "  --no-prefill      run the prompt token by token even when the tiled path fits\n"
     "  --top N           print the N best next tokens (default 5)\n"
     "  --logits FILE     write the last prompt position's f32 logits\n";
 
@@ -623,7 +890,7 @@ static int parse_ids(const char * s, uint32_t ** out, int * n) {
 int main(int argc, char ** argv) {
     const char * dir = NULL, * cfg_path = "models/hf/config.json", * ids_arg = NULL;
     const char * logits_out = NULL;
-    int gen = 0, ctx = 4096, topn = 5;
+    int gen = 0, ctx = 4096, topn = 5, chunk = 512, no_prefill = 0;
 
     for (int i = 1; i < argc; i++) {
         const char * a = argv[i];
@@ -633,6 +900,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--ids") && val) { ids_arg = val; i++; }
         else if (!strcmp(a, "--gen") && val) { gen = atoi(val); i++; }
         else if (!strcmp(a, "--ctx") && val) { ctx = atoi(val); i++; }
+        else if (!strcmp(a, "--chunk") && val) { chunk = atoi(val); i++; }
+        else if (!strcmp(a, "--no-prefill")) { no_prefill = 1; }
         else if (!strcmp(a, "--top") && val) { topn = atoi(val); i++; }
         else if (!strcmp(a, "--logits") && val) { logits_out = val; i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { fputs(USAGE, stdout); return 0; }
@@ -640,6 +909,8 @@ int main(int argc, char ** argv) {
     }
     if (!dir || !ids_arg) { fputs(USAGE, stderr); return 2; }
     if (ctx < 2 || gen < 0 || topn < 1) { fprintf(stderr, "bad --ctx, --gen or --top\n"); return 2; }
+    if (chunk < 1) { fprintf(stderr, "bad --chunk\n"); return 2; }
+    if (chunk > ctx) chunk = ctx;
 
     Cfg c;
     if (parse_config(cfg_path, &c)) return 2;
@@ -655,7 +926,7 @@ int main(int argc, char ** argv) {
     const double t_load = now_s();
     Model m;
     memset(&m, 0, sizeof m);
-    if (alloc_model(&m, &c, ctx)) { fprintf(stderr, "device allocation failed (ctx %d)\n", ctx); return 2; }
+    if (alloc_model(&m, &c, ctx, chunk)) { fprintf(stderr, "device allocation failed (ctx %d, chunk %d)\n", ctx, chunk); return 2; }
     if (load_model(&m, dir)) return 2;
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
@@ -663,16 +934,38 @@ int main(int argc, char ** argv) {
            dir, (double) g_container_bytes / 1e9, (double) fr / 1e9, (double) tot / 1e9,
            now_s() - t_load);
 
-    /* Prompt. One token per forward, which is the decode path; the same ids
-     * the CPU reference was given, so the two logit vectors are comparable. */
+    const int use_prefill = (!no_prefill && m.prefill_ok);
+    if (use_prefill)
+        printf("prefill     tiled f16 mma, %d tokens per chunk\n", chunk);
+    else if (!m.prefill_ok)
+        printf("prefill     off, a matrix's geometry cannot take the tiled kernel; the prompt runs token by token\n");
+    else
+        printf("prefill     off, the prompt runs token by token\n");
+
     const double t_prompt = now_s();
-    for (int i = 0; i < nids; i++) {
-        if (forward(&m, ids[i], i)) return 2;
-        if (i + 1 < nids && ck(cudaDeviceSynchronize(), "prompt sync")) return 2;
+    if (use_prefill) {
+        int last_ntok = 0;
+        for (int t0 = 0; t0 < nids; t0 += chunk) {
+            const int ntok = (nids - t0 < chunk) ? nids - t0 : chunk;
+            if (forward_batch(&m, ids + t0, t0, ntok)) return 2;
+            last_ntok = ntok;
+        }
+        if (tail_logits(&m, m.hb + (size_t) (last_ntok - 1) * c.hidden)) return 2;
+        if (ck(cudaDeviceSynchronize(), "prompt sync")) return 2;
+        const double prompt_s = now_s() - t_prompt;
+        printf("prompt      %d tokens in %.2f s (%.2f tok/s, tiled prefill)\n",
+               nids, prompt_s, (double) nids / prompt_s);
+    } else {
+        /* One token per forward, which is the decode path; the same ids the
+         * CPU reference was given, so the two logit vectors are comparable. */
+        for (int i = 0; i < nids; i++) {
+            if (forward(&m, ids[i], i)) return 2;
+            if (i + 1 < nids && ck(cudaDeviceSynchronize(), "prompt sync")) return 2;
+        }
+        if (ck(cudaDeviceSynchronize(), "prompt sync")) return 2;
+        const double prompt_s = now_s() - t_prompt;
+        printf("prompt      %d tokens in %.2f s (%.2f tok/s)\n", nids, prompt_s, (double) nids / prompt_s);
     }
-    if (ck(cudaDeviceSynchronize(), "prompt sync")) return 2;
-    const double prompt_s = now_s() - t_prompt;
-    printf("prompt      %d tokens in %.2f s (%.2f tok/s)\n", nids, prompt_s, (double) nids / prompt_s);
 
     float * host_logits = (float *) malloc((size_t) c.vocab * 4);
     if (!host_logits) { fprintf(stderr, "cannot allocate the logit buffer\n"); return 2; }

@@ -646,6 +646,27 @@ static int pre_tiled(const uint8_t * p, const layout & L, const float * xT, int 
     return 0;
 }
 
+/* One launch of a tiled prefill with no events and no synchronization. The
+ * model runtime calls this per matrix per prompt chunk and synchronizes once
+ * after the whole prompt, so a timing wrapper would cost 216 synchronizations
+ * per chunk. The shared-memory opt-in is monotone per instantiation: it only
+ * has to grow, and the largest matrix's window covers every smaller one. */
+template <int CB, int DIM>
+static int pre_launch_impl(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y) {
+    static size_t opted = 0;
+    const size_t smem = pre_smem(L, CB);
+    if (smem > opted) {
+        if (cudaFuncSetAttribute(gemm_tiled_kernel<CB, DIM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) smem) != cudaSuccess)
+            return fail("prefill shared memory opt-in", cudaGetLastError());
+        opted = smem;
+    }
+    const dim3 grid((unsigned) ((L.rows + PRE_BM - 1) / PRE_BM),
+                    (unsigned) ((ntok + PRE_BN - 1) / PRE_BN));
+    gemm_tiled_kernel<CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
+    return 0;
+}
+
 extern "C" {
 
 /* Largest dynamic shared-memory window the device accepts; the shared-codebook
@@ -863,6 +884,40 @@ int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v
     if (variant == 1)
         return L.dim == 4 ? pre_tiled<0, 4>(p, L, xT, ntok, y, iters, ms)
                           : pre_tiled<0, 8>(p, L, xT, ntok, y, iters, ms);
+    snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
+    return -1;
+}
+
+/* One prefill launch for a caller that already checked the geometry, with no
+ * timing and no synchronization; y is [ntok][rows] and accumulates. variant 0
+ * picks the tiled kernel when the geometry allows it and the legacy kernel
+ * otherwise, the same rule vqg_prefill uses. */
+int vqg_prefill_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                       const float * xT, int ntok, float * y, int variant) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (ntok <= 0) { snprintf(g_err, sizeof g_err, "prefill needs at least one token"); return -1; }
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "prefill needs a non-empty matrix"); return -1; }
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    const uint8_t * p = (const uint8_t *) payload;
+    if (variant == 0) variant = pre_ok(L) ? 1 : 3;
+    if (variant == 3 || !pre_ok(L)) {
+        const int smem = (int) ((size_t) (L.cols / L.dim) * 2);
+        if (smem > 48 * 1024 &&
+            cudaFuncSetAttribute(gemm_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem) != cudaSuccess)
+            return fail("prefill shared memory opt-in", cudaGetLastError());
+        const dim3 grid((unsigned) L.rows, (unsigned) ((ntok + PRE_LEGACY_THREADS - 1) / PRE_LEGACY_THREADS));
+        gemm_prefill_kernel<<<grid, PRE_LEGACY_THREADS, smem>>>(p, L, xT, ntok, y);
+        return 0;
+    }
+    if (variant == 2) {
+        if (pre_smem(L, 1) > smem_max()) { snprintf(g_err, sizeof g_err, "prefill codebook does not fit shared"); return -1; }
+        return L.dim == 4 ? pre_launch_impl<1, 4>(p, L, xT, ntok, y)
+                          : pre_launch_impl<1, 8>(p, L, xT, ntok, y);
+    }
+    if (variant == 1)
+        return L.dim == 4 ? pre_launch_impl<0, 4>(p, L, xT, ntok, y)
+                          : pre_launch_impl<0, 8>(p, L, xT, ntok, y);
     snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
     return -1;
 }
