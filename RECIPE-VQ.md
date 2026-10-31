@@ -83,20 +83,34 @@ dim4/nc16384.
 
 ## 4. Choosing a rate from a RAM budget: bin/plan
 
-plan reads the checkpoint inventory and prints, for each candidate encoding, the
-exact stored bytes, bits per weight, KV at a chosen context, the measured compute
-buffers and the total against the card. It answers "which encoding fits what RAM"
-instead of guessing.
+plan answers the question directly: if the model is converted this way, how much
+disk and how much VRAM will it take. It reads the checkpoint inventory and prints,
+per encoding, the exact stored bytes, bits per weight, KV at the chosen context,
+the measured compute buffers and the total against the card.
 
-    ./bin/plan models/hf --ctx 131072 --kv q8_0
-    ./bin/plan models/hf --ctx 32768 --kv q8_0 --budget 6000
+    ./bin/plan models/hf                            # standard table, 128K, f16 KV
+    ./bin/plan models/hf --vq 4 4096 2 --vq-embed   # a VQ build, embedding included
+    ./bin/plan models/hf --ctx 65536 --kv q8_0 --budget 9000
+    ./bin/plan models/hf --vq 4 4096 2 --draft models/dspark/Spark-X2.6-4B-DSpark.gguf
+    ./bin/plan models/hf --vq 4 4096 2 --json       # one JSON object per row
 
-The budget form prints the best measured encoding that fits. Byte accounting is
-exact: VQ rows use vq_payload_bytes, the same function the encoder writes with,
-and k-quant rows use the block sizes (Q8_0 34/32, Q6_K 210/256, Q5_K 176/256,
-Q4_K 144/256). The tied embedding stays q8_0 as in the shipped artifact.
+Measured output for the two-stage VQ at 128K with q8_0 KV:
 
-Validation against measured artifacts and runs:
+    encoding           artifact      bpw   weights        KV   buffers      total  headroom
+                             GB                MiB       MiB       MiB        MiB       MiB
+    VQ 4x4096 x2           3.10    6.039      2960      2477      1300       6737      5545   relL2 3.93%
+    Q8_0                   4.37    8.501      4167      2477      1300       7944      4338   relL2 0.54%
+    Q6_K                   3.46    6.722      3295      2477      1300       7072      5210   relL2 1.79%
+    Q5_K                   2.95    5.746      2817      2477      1300       6593      5689   relL2 3.63%
+    Q4_K                   2.48    4.828      2367      2477      1300       6143      6139   relL2 7.17%
+
+So a VQ build costs 3.10 GB on disk and 6,737 MiB resident at 128K with q8_0 KV,
+against 7,072 MiB for the Q6_K that measures twice as accurate. The draft adds
+1,710 MiB to every row when --draft is passed.
+
+Byte accounting is exact: VQ rows use the same payload formula the encoder writes,
+k-quant rows use the block sizes (Q8_0 34/32, Q6_K 210/256, Q5_K 176/256,
+Q4_K 144/256), and 1-D norms stay f32. Validation:
 
 | Item | Predicted | Actual | Error |
 |---|---:|---:|---:|

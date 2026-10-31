@@ -93,7 +93,7 @@ reproduce the loop.
       eg2_vq.c                the encoder (copy of the EmbeddingGemma tool)
       rvq.c                   residual VQ: stacks stages to reach higher rates
       quant_err.c             llama.cpp k-quant error on one HF matrix
-      plan.c                  artifact size and VRAM planner, with --budget
+      plan.c                  artifact size and VRAM planner: ./bin/plan models/hf --vq 4 4096 2
       vendor/                 YoungAi VQ headers, MIT, pinned
     tools/kquant/     llama.cpp's ggml quantizer, vendored, plus its stubs
     tools/runtime/    build-runtime.sh: fetches and builds the pinned llama.cpp trees
