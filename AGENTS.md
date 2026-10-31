@@ -671,6 +671,13 @@ anchor token and advances by argmax of the biased logits of position i. The
 optional confidence head is sigmoid(conf_proj . [hidden(i); markov_w1[prev]]).
 With sample_from_anchor true, position 0 is a real draft slot.
 
+The support is metadata-driven by design: a converter will emit a role
+manifest (dimensions, rope, activation, window, block size, target layers and
+which optional heads exist) and the executor will take all of it from that
+manifest, with one tensor-name table and no per-checkpoint constants. The plan
+is handoff section 4; the same rule as the kernel tuner applies, describe and
+measure the model rather than specialize the tool to it.
+
 Status (2026-10-31, branch feature/dspark-vq): the GGUF reader and the
 architecture dump exist and are committed. The draft forward, the feature
 injection and the propose/verify loop are NOT implemented yet. Acceptance on a
