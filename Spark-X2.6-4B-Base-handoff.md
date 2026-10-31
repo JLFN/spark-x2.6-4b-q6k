@@ -1,9 +1,16 @@
 # Spark-X2.6-4B-Base — session handoff
 
 Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. The active branch is
-feature/dspark-vq (off master at 24eca9e); master itself is 10 commits ahead of
-origin/master and unpushed until that is approved. HEAD on the branch is the
-commit that carries this handoff (docs(handoff): the generic draft plan).
+feature/dspark-vq, forked from master at 24eca9e, with three commits on it:
+
+    8134077  feat(dspark): a GGUF reader and the draft architecture dump
+    33f0599  docs(handoff): the DSpark draft starts
+    680fc41  docs(handoff): the generic draft plan
+
+master itself is 10 commits ahead of origin/master and unpushed until that is
+approved; nothing on the branch is pushed either. HEAD on the branch is the
+commit that carries this handoff (docs(handoff): refresh the position for
+compaction). The working tree is clean once that commit exists.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
