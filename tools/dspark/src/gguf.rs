@@ -13,15 +13,24 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF"
 
 #[derive(Clone, Debug)]
 pub enum Value {
-    U8(u8), I8(i8), U16(u16), I16(i16), U32(u32), I32(i32), F32(f32),
-    Bool(bool), String(String), Array(Vec<Value>),
-    U64(u64), I64(i64), F64(f64),
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    Array(Vec<Value>),
+    U64(u64),
+    I64(i64),
+    F64(f64),
 }
 
 impl Value {
@@ -92,7 +101,7 @@ impl Gguf {
             return Err(format!("{path}: not a GGUF file"));
         }
         let version = r.u32()?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return Err(format!("{path}: GGUF version {version} is not supported"));
         }
         let n_tensors = r.u64()?;
@@ -114,7 +123,12 @@ impl Gguf {
             }
             let dtype = r.u32()?;
             let offset = r.u64()?;
-            tensors.push(TensorInfo { name, dims, dtype, offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                dtype,
+                offset,
+            });
         }
         let alignment = kv
             .get("general.alignment")
@@ -189,8 +203,10 @@ pub fn type_size(dtype: u32, ne: u64) -> Result<u64, String> {
         6 => (32, 22), // Q5_0
         other => return Err(format!("ggml type {other} is not supported by this reader")),
     };
-    if ne % block != 0 {
-        return Err(format!("{ne} elements is not a whole number of {block}-element blocks"));
+    if !ne.is_multiple_of(block) {
+        return Err(format!(
+            "{ne} elements is not a whole number of {block}-element blocks"
+        ));
     }
     Ok(ne / block * bytes)
 }
@@ -305,8 +321,4 @@ fn read_value(r: &mut Reader, ty: u32) -> Result<Value, String> {
         TYPE_F64 => Value::F64(r.f64()?),
         other => return Err(format!("metadata value type {other} is not supported")),
     })
-}
-
-pub fn exists(path: &str) -> bool {
-    Path::new(path).exists()
 }

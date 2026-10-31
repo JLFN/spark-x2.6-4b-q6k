@@ -671,19 +671,55 @@ anchor token and advances by argmax of the biased logits of position i. The
 optional confidence head is sigmoid(conf_proj . [hidden(i); markov_w1[prev]]).
 With sample_from_anchor true, position 0 is a real draft slot.
 
-The support is metadata-driven by design: a converter will emit a role
-manifest (dimensions, rope, activation, window, block size, target layers and
-which optional heads exist) and the executor will take all of it from that
-manifest, with one tensor-name table and no per-checkpoint constants. The plan
-is handoff section 4; the same rule as the kernel tuner applies, describe and
-measure the model rather than specialize the tool to it.
+The support is metadata-driven by design: the converter emits a role manifest
+(dimensions, rope, activation, window, block size, target layers and which
+optional heads exist) and the executor takes all of it from that manifest, with
+one tensor-name table and no per-checkpoint constants. The plan is handoff
+section 4; the same rule as the kernel tuner applies, describe and measure the
+model rather than specialize the tool to it.
 
-Status (2026-10-31, branch feature/dspark-vq): the GGUF reader and the
-architecture dump exist and are committed. The draft forward, the feature
-injection and the propose/verify loop are NOT implemented yet. Acceptance on a
-VQ target is unmeasured and must be measured, because the draft was trained on
-BF16 hidden states and VQ shifts them (manifest relL2 about 2.8-3.4 per
-tensor).
+Convert and check (phase A, done). The tool path is:
+
+    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf
+    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft [--force] [--verify]
+    ./bin/dspark check out/draft
+
+convert copies the tensor bytes into out/draft/weights.bin (64-byte aligned,
+one region per tensor) and writes out/draft/manifest.txt, the role manifest.
+It never decodes a weight; --verify re-reads the output and compares every
+region with the source, which is what backs that claim. It refuses, by tensor
+name, a quantized tensor, a name no role maps, a known role this build does not
+implement (dflash2 conv, selector, lilicorr, attn_sinks, rope_freqs, a draft
+that ships its own embedding or head), and a shape the metadata contradicts.
+check validates the directory alone: every shape is re-derived from the
+manifest's own header, the regions must tile weights.bin with only alignment
+padding between them, and those padding bytes are read to prove they are zero.
+A truncated tensor, an edited offset, a missing required role or a foreign
+architecture is refused with the tensor or field named.
+
+Measured 2026-10-31 on the released draft: 58 tensors, 1,248,919,044 bytes of
+source weights, the same 1,248,919,044 bytes in weights.bin (this file needs no
+alignment padding at all), conversion 3.7 s with --verify, and two runs produce
+a bit-identical weights.bin and manifest. A copy with one tensor's byte count
+reduced by 4 is refused as "tensor attn_q 0: 20971516 bytes recorded, but BF16
+2560x4096 is 20971520 bytes"; a weights.bin truncated by 4 bytes is refused as
+"the last tensor conf_bias ends at byte 1248919044, but weights.bin is
+1248919040 bytes".
+
+The manifest's tensor line is role, layer (0-based, -1 global), dtype code
+(0 F32, 1 F16, 2 BF16), ne0, ne1, offset, bytes. Shapes are the GGUF shapes:
+ne0 is the fastest-varying dimension, so a weight that turns a 2560-vector into
+4096 values is 2560x4096, and fc is 12800x2560 (five target layers x hidden in,
+hidden out). Two fields go beyond the handoff's first sketch because a check
+needs them: vocab, so the Markov head validates without a target, and the
+conf_bias role, because conf_proj ships a bias in the reference.
+
+Status (2026-10-31, branch feature/dspark-vq): the reader, the dump, the
+converter and the checker exist and are committed. The draft forward, the
+feature injection and the propose/verify loop are NOT implemented yet.
+Acceptance on a VQ target is unmeasured and must be measured, because the draft
+was trained on BF16 hidden states and VQ shifts them (manifest relL2 about
+2.8-3.4 per tensor).
 
 Why it is expected to work with VQ: the draft needs the target's embedding
 rows and LM head, both of which the VQ runtime already computes, and its input
@@ -723,7 +759,7 @@ produce. The open risk is acceptance, not plumbing.
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
     tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
     tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
-    tools/dspark/       DSpark draft GGUF reader and inspection (bin/dspark, section 8d)
+    tools/dspark/       DSpark draft reader, converter and checker (bin/dspark, section 8d)
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)

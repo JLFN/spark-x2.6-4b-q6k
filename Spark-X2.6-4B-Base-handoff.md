@@ -1,16 +1,17 @@
 # Spark-X2.6-4B-Base — session handoff
 
 Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. The active branch is
-feature/dspark-vq, forked from master at 24eca9e, with three commits on it:
+feature/dspark-vq, forked from master at 24eca9e, with these commits on it:
 
     8134077  feat(dspark): a GGUF reader and the draft architecture dump
     33f0599  docs(handoff): the DSpark draft starts
     680fc41  docs(handoff): the generic draft plan
+    8ec385e  docs(handoff): refresh the position for compaction
 
-master itself is 10 commits ahead of origin/master and unpushed until that is
-approved; nothing on the branch is pushed either. HEAD on the branch is the
-commit that carries this handoff (docs(handoff): refresh the position for
-compaction). The working tree is clean once that commit exists.
+plus the commit that carries this handoff, feat(dspark): convert a draft to a
+role manifest and check it. master is 10 commits ahead of origin/master and
+unpushed until that is approved; nothing on the branch is pushed either. The
+working tree is clean once that commit exists.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -56,9 +57,11 @@ result. Where a number is missing it says so.
 - DSpark draft: models/dspark/Spark-X2.6-4B-DSpark.gguf is read by the new
   bin/dspark dump (tools/dspark), and its architecture is recorded in AGENTS.md
   section 8d: 5 SWA blocks, 2560 hidden, 16/4 heads x 256, gelu, block size 7,
-  target layers [3, 11, 19, 26, 34], and a Markov head over the block. The
-  draft forward and the propose/verify loop are NOT implemented; that is the
-  active unit on branch feature/dspark-vq.
+  target layers [3, 11, 19, 26, 34], and a Markov head over the block.
+  Phase A is done: bin/dspark convert writes out/draft (weights.bin plus the
+  role manifest) and bin/dspark check validates it, measured in section 2. The
+  draft forward, the feature injection and the propose/verify loop are NOT
+  implemented; they are phases B-D below.
 
 ## 2. Measurements (do not re-derive)
 
@@ -272,10 +275,9 @@ break-even down. None of this is a result until phase D runs.
    VQ runtime or the CPU reference. The only per-family text in the code is the
    tensor-name table, and it lives in one place.
 
-   Phase A, converter and check (Rust, tools/dspark). The reader exists; this
-   phase adds the output format and its validation.
+   Phase A, converter and check (Rust, tools/dspark). DONE 2026-10-31.
 
-       dspark convert DRAFT.gguf OUTDIR
+       dspark convert DRAFT.gguf OUTDIR [--force] [--verify]
        dspark check OUTDIR
 
    OUTDIR holds weights.bin (64-byte aligned, one region per tensor) and
@@ -289,11 +291,12 @@ break-even down. None of this is a result until phase D runs.
        heads 16
        kv_heads 4
        head_dim 256
+       vocab 131072
        rope_full_dims 64
        rope_swa_dims 256
        rope_full_theta 5000000
        rope_swa_theta 10000
-       eps 1e-06
+       eps 0.000001
        act gelu
        swa_window 512
        swa_pattern 1,1,1,1,1
@@ -302,30 +305,49 @@ break-even down. None of this is a result until phase D runs.
        sample_from_anchor 1
        target_layers 3,11,19,26,34
        tensor attn_norm 0 0 2560 1 0 10240
-       tensor fc -1 2 2560 12800 10240 65536000
+       tensor fc -1 2 12800 2560 1049088000 65536000
        ...
        end
 
    The tensor line is: role, layer index (0-based; -1 for a global tensor),
    dtype code (0 F32, 1 F16, 2 BF16; quantized codes are refused until a
-   kernel exists for them), ne0, ne1, byte offset, byte count. The example
-   above is blk.0.attn_norm (F32, 2560 values, 10,240 bytes) and fc (BF16,
-   2560 x 12800, 65,536,000 bytes). Roles are the vocabulary both sides
-   share: attn_norm, attn_q, attn_k, attn_v, attn_out, attn_gate, ffn_norm,
-   ffn_gate, ffn_up, ffn_down, output_norm, fc, fc_norm, enc_norm, markov_w1,
-   markov_w2, conf_proj, and the optional dflash2 roles (conv_base, conv_proj)
-   and lilicorr roles. Capabilities are derived from role presence and are
-   explicit in the manifest: markov needs markov_w1+w2, confidence needs
-   conf_proj, and so on. A GGUF tensor that maps to no role is an error, never
-   ignored, and a declared arch whose required roles are missing is an error
-   too.
+   kernel exists for them), ne0, ne1, byte offset, byte count. Shapes are the
+   GGUF shapes, so ne0 is the fastest-varying dimension: blk.0.attn_norm is
+   F32 2560x1, and fc is BF16 12800x2560 (five target layers of hidden in,
+   hidden out, which is how the reference creates it: n_embd_inp, n_embd).
+   Roles are the vocabulary both sides share: attn_norm, attn_q, attn_k,
+   attn_v, attn_out, attn_gate, attn_q_norm, attn_k_norm, attn_post_norm,
+   ffn_norm, ffn_gate, ffn_up, ffn_down, ffn_post_norm, layer_out_scale, and
+   the globals fc, fc_norm, enc_norm, output_norm, markov_w1, markov_w2,
+   conf_proj, conf_bias. Capabilities are derived from role presence: markov
+   needs markov_w1+w2, confidence needs conf_proj+conf_bias, and attn_gate
+   excludes the q/k norms. A GGUF tensor that maps to no role is an error,
+   never ignored, and so is a known role this build does not implement
+   (dflash2 conv, selector, lilicorr, attn_sinks, rope_freqs, a draft with its
+   own embedding or head). This checkpoint has neither conv nor selector nor
+   lilicorr tensors, so those name mappings are deliberately unimplemented
+   rather than guessed from an unseen file.
 
    check validates every shape against the header: q = heads*head_dim,
    k/v = kv_heads*head_dim, ffn, fc = len(target_layers)*hidden x hidden,
-   markov = rank x vocab, and that the offsets tile weights.bin exactly.
-   Acceptance: the Spark draft converts and checks with 58 tensors and
-   1,249,293,824 bytes of source weights; a manifest with one truncated tensor
-   is refused with the tensor name.
+   markov = rank x vocab, and that the offsets tile weights.bin exactly (first
+   region at 0, 64-byte aligned, no overlap, only sub-64-byte alignment gaps,
+   last region ending at the file's length). It also reads the padding bytes to
+   prove they are zero.
+
+   Acceptance, met 2026-10-31: the Spark draft converts and checks with 58
+   tensors and 1,248,919,044 bytes of source weights, the same byte count in
+   weights.bin (this file happens to need no padding), in 3.7 s with --verify,
+   and two runs are bit-identical. A manifest with one tensor's byte count cut
+   by 4 is refused as "tensor attn_q 0: 20971516 bytes recorded, but BF16
+   2560x4096 is 20971520 bytes"; a weights.bin cut by 4 bytes is refused as
+   "the last tensor conf_bias ends at byte 1248919044, but weights.bin is
+   1248919040 bytes"; unknown roles, missing roles, a foreign arch, a wrong
+   swa_pattern length, a half-present gate family, non-zero padding and a
+   64-byte gap are each refused with the field or tensor named. The earlier
+   figure 1,249,293,824 in this file was the GGUF file length, not the weight
+   bytes; the converter's own sum and a hand sum of the 58 tensor sizes agree
+   on 1,248,919,044.
 
    Phase B, CPU draft forward (Rust), gated in two steps.
 
@@ -423,8 +445,8 @@ EAGLE-style pattern, and it is the only multi-token path available here.
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512 --no-prefill --logits /tmp/gpu-tok.f32
     ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf   # exists
-    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft   # planned (phase A)
-    ./bin/dspark check out/draft                                            # planned (phase A)
+    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft --verify   # exists
+    ./bin/dspark check out/draft                                            # exists
     ./bin/dspark bench --target models/vq-build-8192-2-v3 --draft out/draft --gen 64   # planned (phase D)
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
     ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
@@ -483,6 +505,19 @@ EAGLE-style pattern, and it is the only multi-token path available here.
 - The draft borrows the target's token_embd and LM head and has neither of its
   own; a draft forward that tries to load weights for them will fail. Its
   weights are BF16 (tensors) and F32 (norms), 1.249 GB, 58 tensors.
+- Manifest shapes are GGUF shapes: ne0 is the fastest-varying dimension. The
+  reference creates fc as {n_embd_inp, n_embd} = {12800, 2560}, so the stored
+  tensor is 12800x2560, not 2560x12800. The first converter assumed the other
+  orientation and check refused it at once, which is the gate working.
+- The weight bytes of the draft are 1,248,919,044. The GGUF file is
+  1,254,293,824 bytes; the earlier 1,249,293,824 in this handoff was neither,
+  it was the file length with a digits transposed. Do not use a file length as
+  a weight total.
+- The converted layout has no alignment padding at all for this file because
+  every tensor before the last is a multiple of 64 bytes and conf_bias (4
+  bytes) is last; weights.bin therefore ends unaligned and that is legal. The
+  padding rule is exercised by a synthetic 12-tensor draft in /tmp, not by the
+  real one.
 - A tuning profile is bound to the artifact fingerprint and the device name.
   A profile from another artifact, another GPU, or a changed container is
   refused with a printed reason and the heuristic runs; --no-tune skips the
