@@ -22,6 +22,9 @@ extern "C" {
 }
 
 extern "C" {
+    /// Whether a variant can run on this geometry (3 = DQV3 block kernel,
+    /// 2 = dim-4 fast path, 1 = generic warp, 0 = shared codebook).
+    pub fn vqg_gemv_ready(dim: i32, nc: i32, rows: i32, cols: i32, v3: i32, variant: i32) -> i32;
     /// Fused gather+dot per stage; variant 2 is the dim-4 fast kernel.
     pub fn vqg_gemv(
         payload: *const c_void,

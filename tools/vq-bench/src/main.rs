@@ -153,8 +153,16 @@ fn run(o: &Opt) -> Result<(), String> {
     };
 
     let started = Instant::now();
+    let mut v3blk = 0usize;
+    let mut fast = 0usize;
+    let mut generic = 0usize;
     for t in &m.tensors {
         let s = h.measure(t)?;
+        match s.variant {
+            3 => v3blk += 1,
+            2 => fast += 1,
+            _ => generic += 1,
+        }
         r.tensors += 1;
         r.container_bytes += t.file_bytes;
         r.weights += t.rows as u64 * t.cols as u64;
@@ -181,6 +189,17 @@ fn run(o: &Opt) -> Result<(), String> {
     println!("artifact    {}", m.dir.display());
     println!("tensors     {} matrices, {} weights", r.tensors, r.weights);
     println!("container   {gb:.4} GB ({bpw:.4} bits/weight)");
+    let mut paths = Vec::new();
+    if v3blk > 0 {
+        paths.push(format!("{v3blk} DQV3 block"));
+    }
+    if fast > 0 {
+        paths.push(format!("{fast} dim-4 fast"));
+    }
+    if generic > 0 {
+        paths.push(format!("{generic} generic warp (untuned)"));
+    }
+    println!("kernels     {}", paths.join(", "));
     println!(
         "decode      {:.3} ms/token, {:.2} GB/s of container",
         r.decode_ms,

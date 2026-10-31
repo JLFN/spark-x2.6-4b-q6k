@@ -99,6 +99,11 @@ static int parse_header(const uint8_t * buf, size_t n, hdr_t * h) {
 
 static int v3_bits(int nc) { int b = 1; while ((1 << b) < nc) b++; return b < 1 ? 1 : b; }
 
+/* DQV3 carries 12 bits in the main stream plus one plane bit, so its index
+ * width is at most 13 (nc <= 8192). A wider nc would decode to truncated
+ * indices with no error, so it is refused (build-vq-gpu.c packs only 13). */
+static int v3_width_ok(int nc) { return v3_bits(nc) <= 13; }
+
 static size_t v2_stage_bytes(int rows, int cols, int dim, int nc) {
     const size_t nidx = (size_t) rows * cols / dim;
     int bits = v3_bits(nc);
@@ -146,6 +151,7 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
     memcpy(&nc, p + 6, 2);
     memcpy(&rows, p + 8, 4);
     memcpy(&cols, p + 12, 4);
+    if (v3 && !v3_width_ok(nc)) return -1;
     *rows_o = rows;
     *cols_o = cols;
 
@@ -220,6 +226,11 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
 
 static int decode_all(const uint8_t * buf, size_t n, hdr_t * h, float ** out_w) {
     if (parse_header(buf, n, h)) return -1;
+    if (!memcmp(buf + 32, "DQV3", 4) && !v3_width_ok(h->nc)) {
+        fprintf(stderr, "DQV3 carries 13 index bits, nc %u needs %d; rewrite with --format v2\n",
+                h->nc, v3_bits(h->nc));
+        return -1;
+    }
     const size_t per = (size_t) h->payload / h->stages;
     const size_t want = stage_bytes_for((int) h->rows, (int) h->cols, h->dim, h->nc, buf + 32) * h->stages;
     if (per * h->stages != (size_t) h->payload) {
@@ -260,13 +271,19 @@ static int cmd_info(const char * path) {
     hdr_t h;
     if (parse_header(buf, n, &h)) { fprintf(stderr, "%s: not an RQVQ container\n", path); return 1; }
     const int v3 = !memcmp(buf + 32, "DQV3", 4);
+    if (v3 && !v3_width_ok(h.nc)) {
+        fprintf(stderr, "%s: DQV3 carries 13 index bits, nc %u needs %d\n",
+                path, h.nc, v3_bits(h.nc));
+        free(buf);
+        return 1;
+    }
     const size_t per = stage_bytes_for((int) h.rows, (int) h.cols, h.dim, h.nc, buf + 32);
     const size_t want = per * h.stages;
 
     const size_t nidx_row = (size_t) h.rows ? (size_t) h.cols / h.dim : 0;
     const int bits = v3_bits(h.nc);
     const int mb = bits > 12 ? 12 : bits;
-    const size_t idxbytes = (v3 ? (size_t) h.rows * ((nidx_row * (size_t) mb + 7) / 8)
+    const size_t idxbytes = (v3 ? (size_t) h.rows * ((nidx_row * (size_t) mb + 7) / 8 + (bits > 12 ? (nidx_row + 7) / 8 : 0))
                                 : (bits == 8 ? (size_t) h.rows * nidx_row
                                              : ((size_t) h.rows * nidx_row * (size_t) bits + 7) / 8 + 1));
 

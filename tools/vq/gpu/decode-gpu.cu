@@ -33,7 +33,7 @@ static int fail(const char * what, cudaError_t e) {
 struct layout {
     int dim, nc, rows, cols, nbit, v3;
     unsigned mask;
-    size_t cb_off, gain_off, stream_off, nidx;
+    size_t cb_off, gain_off, stream_off, nidx, nidx_row;
     size_t mrow, prow;   /* DQV3: bytes per row of the 12-bit main stream and of the plane */
 };
 
@@ -49,9 +49,33 @@ static layout make_layout(int dim, int nc, int rows, int cols, int v3) {
     L.gain_off = L.cb_off + (size_t) nc * dim * 2;
     L.stream_off = L.gain_off + (size_t) rows * 2;
     L.nidx = (size_t) rows * cols / dim;
+    L.nidx_row = nidx_row;
     L.mrow = v3 ? (nidx_row * (size_t) mb + 7) / 8 : 0;
     L.prow = (v3 && L.nbit > 12) ? (nidx_row + 7) / 8 : 0;
     return L;
+}
+
+/* Preconditions of the DQV3 block kernel: a v3 payload whose index stream
+ * starts on a 4-byte boundary in every row, with no partial 32-index group
+ * (the rounds map assumes whole groups; a partial one would read past x). */
+static int v3_blk_ok(const layout & L) {
+    return L.v3 && L.nidx_row % 32 == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
+}
+
+/* DQV3 carries 12 main-stream bits plus one plane bit, so nc above 8192 would
+ * be decoded from truncated indices with no error. Refuse it in every entry
+ * point instead (build-vq-gpu.c refuses to write such a container). */
+static int v3_width_ok(int nc) {
+    int b = 1;
+    while ((1 << b) < nc) b++;
+    return b <= 13;
+}
+
+static int bad_width(int nc) {
+    int b = 1;
+    while ((1 << b) < nc) b++;
+    snprintf(g_err, sizeof g_err, "DQV3 carries 13 index bits, nc %d needs %d", nc, b);
+    return -1;
 }
 
 __device__ __forceinline__ uint32_t rd_idx(const uint8_t * s, size_t i, int nbit, uint32_t mask) {
@@ -143,6 +167,118 @@ __global__ void gemv_warp4_kernel(const uint8_t * p, const layout L, const float
         const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&c.x));
         const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&c.y));
         acc += a.x * xv.x + a.y * xv.y + b.x * xv.z + b.y * xv.w;
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[r] += acc * __half2float(gr[r]);
+}
+
+/* ---- DQV3 block-load decode ---------------------------------------------
+ *
+ * The v3 stream is one 12-bit index after another, row by row, so a warp can
+ * read it as whole 96-word blocks (three 128-byte lines) instead of one index
+ * at a time: lane j takes words j / j+32 / j+64, and a round's index word is
+ * fetched from the lane that holds it by a shuffle plus a funnel shift. The
+ * block's 13th bits are 8 words for 256 indices, so lane j<8 holds word j and
+ * round k takes bit `lane` of the word held by lane k: one more shuffle, no
+ * extra memory traffic.
+ *
+ * Ported from ds4-dfm-rs cuda/ds41_vq_row.cuh:122-137 (the 3-line block and
+ * whose-lane-holds-what map) and :200-220 (the per-round funnelshift and the
+ * plane bit by shfl). The index numbering is unchanged: index i of a row sits
+ * at bit 12*i, so round k's lane j is index 32(b+k)+j, word 12k+floor(3j/8),
+ * shift 12j%32. The kernel is gated against the host f64 matvec, not against
+ * the other kernels' accumulation order. */
+
+struct v3blk { uint32_t w0, w1, w2, ex; };
+
+__device__ __forceinline__ uint32_t v3_sel3(uint32_t r, uint32_t w0, uint32_t w1, uint32_t w2) {
+    return r == 0u ? w0 : (r == 1u ? w1 : w2);
+}
+
+/* Only the words that exist are read: a tail block has fewer than 96, and its
+ * plane fewer than 8. The payload's tail pad is not relied on. */
+__device__ __forceinline__ v3blk v3_blk_load(const uint32_t * blk, uint32_t nw,
+                                             const uint32_t * bex, uint32_t nwx) {
+    const uint32_t lane = threadIdx.x & 31u;
+    v3blk b;
+    b.w0 = b.w1 = b.w2 = b.ex = 0u;
+    if (lane < nw)          b.w0 = blk[lane];
+    if (lane + 32u < nw)    b.w1 = blk[lane + 32u];
+    if (lane + 64u < nw)    b.w2 = blk[lane + 64u];
+    if (bex && lane < nwx)  b.ex = bex[lane];
+    return b;
+}
+
+/* One block's rounds. DIM 4 has the uint2 codebook load and half2 conversion;
+ * DIM 0 is the generic path at L.dim. EXT 1 reads the 13th bit from the plane,
+ * EXT 0 is a 12-bit layer (nc <= 4096) with no plane at all. */
+template <int DIM, int EXT>
+__device__ __forceinline__ void v3_rounds(const v3blk & cur, uint32_t rounds, uint32_t a, uint32_t sh,
+                                          const float * xb, const __half * cb, int dim, float & acc) {
+    const uint32_t lane = threadIdx.x & 31u;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8u; k++) {
+        if (k >= rounds) break;
+        const uint32_t f = k * 12u;                                      /* first word of this round */
+        const uint32_t lo_r = ((f & 31u) > 32u - 12u) ? ((f + 31u - lane) >> 5) : (f >> 5);
+        const uint32_t hi_r = (((f + 1u) & 31u) > 32u - 12u) ? ((f + 32u - lane) >> 5) : ((f + 1u) >> 5);
+        const uint32_t lo = __shfl_sync(0xffffffffu, v3_sel3(lo_r, cur.w0, cur.w1, cur.w2), (int) (f + a));
+        const uint32_t hi = __shfl_sync(0xffffffffu, v3_sel3(hi_r, cur.w0, cur.w1, cur.w2), (int) (f + a + 1u));
+        uint32_t v = __funnelshift_r(lo, hi, sh) & 0xFFFu;
+        if (EXT) {
+            const uint32_t exw = __shfl_sync(0xffffffffu, cur.ex, (int) k);
+            v |= ((exw >> lane) & 1u) << 12;
+        }
+        const size_t g = (size_t) (k * 32u + lane);
+        if (DIM == 4) {
+            const float4 xv = *(const float4 *) (xb + g * 4u);
+            const uint2 c = __ldg((const uint2 *) cb + v);
+            const float2 f0 = __half22float2(*reinterpret_cast<const __half2 *> (&c.x));
+            const float2 f1 = __half22float2(*reinterpret_cast<const __half2 *> (&c.y));
+            acc += f0.x * xv.x + f0.y * xv.y + f1.x * xv.z + f1.y * xv.w;
+        } else {
+            const __half * cw = cb + (size_t) v * (size_t) dim;
+            const float * xg = xb + g * (size_t) dim;
+            for (int d = 0; d < dim; d++) acc += __half2float(cw[d]) * xg[d];
+        }
+    }
+}
+
+/* One warp per row. The next block's three words are issued before this block
+ * computes, which is the reference's cross-block pipeline (cuda_vq_row.inc.cu:
+ * 163-175): with 32 warps in lockstep, every warp waits on DRAM together
+ * otherwise. */
+template <int DIM, int EXT>
+__global__ void gemv_v3blk_kernel(const uint8_t * p, const layout L, const float * x, float * y) {
+    const uint32_t warp = (uint32_t) ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (warp >= (uint32_t) L.rows) return;
+    const int r = (int) warp;
+    const __half * cb = (const __half *) (p + L.cb_off);
+    const __half * gr = (const __half *) (p + L.gain_off);
+    const uint32_t * row = (const uint32_t *) (p + L.stream_off + (size_t) r * L.mrow);
+    const uint32_t * rex = EXT
+        ? (const uint32_t *) (p + L.stream_off + L.mrow * (size_t) L.rows + (size_t) r * L.prow)
+        : NULL;
+    const uint32_t R = (uint32_t) (L.nidx_row >> 5);          /* groups of 32 indices */
+    const uint32_t nblk = (R + 7u) >> 3;
+    const uint32_t a = (lane * 12u) >> 5, sh = (lane * 12u) & 31u;
+
+    v3blk cur = v3_blk_load(row, R >= 8u ? 96u : R * 12u, rex, R >= 8u ? 8u : R);
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < nblk; b++) {
+        v3blk nxt;
+        if (b + 1u < nblk) {
+            const uint32_t nrem = R - (b + 1u) * 8u, nr = nrem < 8u ? nrem : 8u;
+            nxt = v3_blk_load(row + (size_t) (b + 1u) * 96u, nr * 12u,
+                              EXT ? rex + (b + 1u) * 8u : NULL, nr);
+        } else {
+            nxt.w0 = nxt.w1 = nxt.w2 = nxt.ex = 0u;
+        }
+        const uint32_t rem = R - b * 8u;
+        v3_rounds<DIM, EXT>(cur, rem < 8u ? rem : 8u, a, sh,
+                            x + (size_t) b * 256u * (DIM > 0 ? DIM : L.dim), cb, L.dim, acc);
+        cur = nxt;
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[r] += acc * __half2float(gr[r]);
@@ -269,10 +405,37 @@ __global__ void gemv_f32_kernel(const float * w, const float * x, float * y, int
 
 extern "C" {
 
+/* Largest dynamic shared-memory window the device accepts; the shared-codebook
+ * variant needs nc*dim f16 in one block, which a wide codebook cannot fit. */
+static size_t smem_max(void) {
+    static size_t v = 0;
+    if (!v) {
+        int x = 0;
+        v = (cudaDeviceGetAttribute(&x, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0) == cudaSuccess && x > 0)
+            ? (size_t) x : (size_t) (48 * 1024);
+    }
+    return v;
+}
+
+/* Whether a variant can run on this geometry; variant 3 (the DQV3 block
+ * kernel) needs 4-byte-aligned row streams and no partial 32-index group, so
+ * a caller must ask before timing it. */
+int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant) {
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    switch (variant) {
+        case 3: return v3_blk_ok(L);
+        case 2: return L.dim == 4;
+        case 1: return 1;   /* generic warp, any dim */
+        case 0: return (size_t) L.nc * L.dim * 2 <= smem_max();
+        default: return 0;
+    }
+}
+
 /* Decode one stage into out (device pointer), then optionally time `iters`
  * repeated launches. Returns the elapsed milliseconds of the best iteration. */
 int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
                 float * out, int iters, double * ms) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const int threads = 256;
     const int blocks = (int) ((L.nidx + threads - 1) / threads);
@@ -299,6 +462,7 @@ int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v
  * variant 0 = shared-memory codebook, 1 = warp per row with the table in L1. */
 int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
              const float * x, float * y, int variant, int iters, double * ms) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const int threads = 256;
     const size_t smem = (variant == 0) ? (size_t) L.nc * L.dim * 2 : 0;
@@ -315,6 +479,15 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(a);
         if (variant == 0)      gemv_kernel<<<blocks, threads, smem>>>((const uint8_t *) payload, L, x, y);
+        else if (variant == 3 && v3_blk_ok(L)) {
+            if (L.dim == 4) {
+                if (L.prow) gemv_v3blk_kernel<4, 1><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
+                else        gemv_v3blk_kernel<4, 0><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
+            } else {
+                if (L.prow) gemv_v3blk_kernel<0, 1><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
+                else        gemv_v3blk_kernel<0, 0><<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
+            }
+        }
         else if (variant == 2 && L.dim == 4) gemv_warp4_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
         else                   gemv_warp_kernel<<<blocks, threads>>>((const uint8_t *) payload, L, x, y);
         cudaEventRecord(b);
@@ -332,6 +505,7 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
 /* Prefill one stage: xT is [cols][ntok], y is [ntok][rows], both device-side. */
 int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3,
                 const float * xT, int ntok, float * y, int iters, double * ms) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const int smem = /* shared index staging */ (int) ((size_t) (cols / dim) * 2);
     if (smem > 48 * 1024 &&

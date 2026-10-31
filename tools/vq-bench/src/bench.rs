@@ -130,9 +130,22 @@ impl Harness {
         let v3 = &raw[32..36] == b"DQV3";
         let dim = u16::from_le_bytes([raw[32 + 4], raw[32 + 5]]) as i32;
         let nc = u16::from_le_bytes([raw[32 + 6], raw[32 + 7]]) as i32;
-        if dim != 4 {
-            return Err(format!("{}: dim {dim}, the fast kernel is dim 4", t.path.display()));
+        if t.cols as i32 % dim != 0 {
+            return Err(format!(
+                "{}: cols {} is not a multiple of dim {dim}",
+                t.path.display(),
+                t.cols
+            ));
         }
+        /* Fastest kernel this geometry can run: the DQV3 block kernel when the
+         * payload is v3 and its rows are aligned, else the dim-4 fast path,
+         * else the generic warp-per-row kernel (correct but untuned). The
+         * report names the path so a slow number is not mistaken for the
+         * format's. */
+        let ready = |v: i32| unsafe {
+            crate::cuda::vqg_gemv_ready(dim, nc, t.rows as i32, t.cols as i32, v3 as i32, v) != 0
+        };
+        let variant: i32 = if ready(3) { 3 } else if ready(2) { 2 } else { 1 };
         let per = payload / t.stages as usize;
         let aper = (per + 7) & !7usize;
 
@@ -163,7 +176,7 @@ impl Harness {
                     v3 as i32,
                     self.x.ptr() as *const f32,
                     self.yt.ptr() as *mut f32,
-                    2,
+                    variant,
                     self.iters as i32,
                     &mut ms,
                 )
@@ -230,6 +243,7 @@ impl Harness {
             decode_ms,
             prefill_ms,
             dequant_ms,
+            variant,
         })
     }
 }
@@ -238,6 +252,8 @@ pub struct Sample {
     pub decode_ms: f64,
     pub prefill_ms: f64,
     pub dequant_ms: f64,
+    /// Kernel used for the fused GEMV: 2 = dim-4 fast path, 1 = generic warp.
+    pub variant: i32,
 }
 
 /// Aggregate over the whole artifact, in the ds4-bench column order.

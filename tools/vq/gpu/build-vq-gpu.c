@@ -141,6 +141,15 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--format") && i + 1 < argc) fmt_v3 = !strcmp(argv[++i], "v3");
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
+    /* DQV3 addresses at most 13 bits: 12 in the row's main stream plus one in
+     * its plane (v3_main_bits, v3_pack). For nc above 8192 the packer would
+     * keep only the low 13 bits and the container would decode to different
+     * weights with no error at all, so the encoding is refused instead. */
+    if (fmt_v3 && v3_main_bits(nc) > 13) {
+        fprintf(stderr, "nc %d needs %d index bits; DQV3 carries 13 (12 + one plane bit). "
+                        "Use --format v2 or nc <= 8192.\n", nc, v3_main_bits(nc));
+        return 2;
+    }
 
     v41_st S;
     if (v41_st_open(&S, hf)) { fprintf(stderr, "cannot open %s\n", hf); return 1; }

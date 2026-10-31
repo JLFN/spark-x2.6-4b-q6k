@@ -124,6 +124,11 @@ impl<'a> Stage<'a> {
         while (1usize << nbit) < nc {
             nbit += 1;
         }
+        if v3 && nbit > 13 {
+            return Err(format!(
+                "DQV3 carries 13 index bits, nc {nc} needs {nbit}; rewrite with --format v2"
+            ));
+        }
         let nidx_row = cols / dim;
         let (mrow, prow, idx_bytes) = if v3 {
             let mb = (nbit as usize).min(12);
@@ -256,6 +261,14 @@ fn open(buf: &[u8]) -> Result<Container<'_>, String> {
         nbit += 1;
     }
     let v3 = buf.len() >= 36 && &buf[32..36] == b"DQV3";
+    /* DQV3 carries 12 main-stream bits plus one plane bit; a wider index
+     * width would decode truncated indices with no error (v3_pack and every
+     * decoder cap the width at 13), so refuse it here. */
+    if v3 && nbit > 13 {
+        return Err(format!(
+            "DQV3 carries 13 index bits, nc {nc} needs {nbit}; rewrite with --format v2"
+        ));
+    }
     let nidx_row = cols / dim;
     let per = if v3 {
         let mb = (nbit as usize).min(12);

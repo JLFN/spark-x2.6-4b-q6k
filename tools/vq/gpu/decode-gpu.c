@@ -24,6 +24,7 @@
 extern const char * vqg_decode_error(void);
 extern int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3, float * out, int iters, double * ms);
 extern int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * x, float * y, int variant, int iters, double * ms);
+extern int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant);
 extern int vqg_gemv_f32(const float * w, const float * x, float * y, int rows, int cols, int iters, double * ms);
 extern int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v3, const float * xT, int ntok, float * y, int iters, double * ms);
 
@@ -48,6 +49,14 @@ static int cuda_ok(cudaError_t e, const char * what) {
     return -1;
 }
 
+/* Fastest kernel this geometry can run: the DQV3 block kernel when the payload
+ * is v3 and aligned, else the dim-4 fast path, else the generic warp. */
+static int pick_variant(int dim, int nc, int rows, int cols, int v3) {
+    if (vqg_gemv_ready(dim, nc, rows, cols, v3, 3)) return 3;
+    if (vqg_gemv_ready(dim, nc, rows, cols, v3, 2)) return 2;
+    return 1;
+}
+
 /* Benchmark every matrix listed in <dir>/manifest.txt and report the decode
  * rate of the whole artifact: container bytes per second, and the modeled
  * tokens per second of the fused path (one pass over all weights per token). */
@@ -60,6 +69,7 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
     double fused_ms = 0.0, dequant_ms = 0.0, prefill_ms = 0.0;
     size_t bytes = 0, weights = 0;
     int tensors = 0;
+    int kv[4] = {0, 0, 0, 0};   /* tensors per fused variant, for the report */
     float * scratch = NULL;
     size_t scratch_bytes = 0;
     float * xT = NULL, * yT = NULL;
@@ -124,9 +134,11 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
         cudaMemset(dy, 0, (size_t) rows * 4);
 
         double f = 0.0, d = 0.0;
+        const int fv = pick_variant(dim, nc, (int) rows, (int) cols, v3);
+        kv[fv]++;
         for (uint16_t s = 0; s < stages; s++) {
             double ms = 0.0;
-            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, 2, iters, &ms)) {
+            if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, fv, iters, &ms)) {
                 fprintf(stderr, "%s: %s\n", path, vqg_decode_error());
                 free(x); cudaFree(dbuf); cudaFree(dx); cudaFree(dy); free(buf); fclose(mf);
                 return 1;
@@ -238,6 +250,17 @@ static int cmd_manifest(const char * dir, int iters, int prefill_tok, long long 
     printf("tensors     %d matrices, %zu weights\n", tensors, weights);
     printf("container   %.4f GB (%.4f bits/weight)\n",
            (double) bytes / 1e9, (double) bytes * 8.0 / (double) weights);
+    {
+        const char * nm[4] = {"smem", "warp", "fast", "v3blk"};
+        int first = 1;
+        printf("kernels     ");
+        for (int v = 3; v >= 0; v--) {
+            if (!kv[v]) continue;
+            printf("%s%d %s", first ? "" : ", ", kv[v], nm[v]);
+            first = 0;
+        }
+        printf("\n");
+    }
     printf("fused       %.3f ms/token, %.2f GB/s of container\n",
            fused_ms, (double) bytes / 1e9 / (fused_ms * 1e-3));
     printf("dequant     %.3f ms, %.2f GB/s of container\n",
@@ -340,10 +363,13 @@ int main(int argc, char ** argv) {
     if (cuda_ok(cudaMemcpy(dx, x, (size_t) cols * 4, cudaMemcpyHostToDevice), "upload x")) return 1;
     if (cuda_ok(cudaMemset(dy, 0, (size_t) rows * 4), "zero y")) return 1;
 
-    /* Fused path: dim-4 fast kernel, plain warp-per-row, and the shared-memory
-     * variant, all pumping the same bytes. */
-    double fused_ms[3] = {0, 0, 0};
-    for (int variant = 2; variant >= 0; variant--) {
+    /* Fused path: every variant this geometry can run, all pumping the same
+     * bytes. Variant 3 is the DQV3 block kernel, 2 the dim-4 fast path, 1 the
+     * generic warp, 0 the shared-memory codebook. */
+    double fused_ms[4] = {0, 0, 0, 0};
+    int have[4] = {0, 0, 0, 0};
+    for (int variant = 3; variant >= 0; variant--) {
+        if (!vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, variant)) continue;
         double total = 0.0;
         if (cuda_ok(cudaMemset(dy, 0, (size_t) rows * 4), "zero y")) return 1;
         for (uint16_t s = 0; s < stages; s++) {
@@ -355,6 +381,7 @@ int main(int argc, char ** argv) {
             total += ms;
         }
         fused_ms[variant] = total;
+        have[variant] = 1;
     }
 
     /* Expanded path: dequant every stage into one f32 matrix, then multiply. */
@@ -390,10 +417,11 @@ int main(int argc, char ** argv) {
 
     /* The timing loops accumulate into y, so take one clean fused pass for the
      * result and the gate. */
+    const int best = pick_variant(dim, nc, (int) rows, (int) cols, v3);
     if (cuda_ok(cudaMemset(dy, 0, (size_t) rows * 4), "zero y")) return 1;
     for (uint16_t s = 0; s < stages; s++) {
         double ms = 0.0;
-        if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, 2, 1, &ms)) {
+        if (vqg_gemv(dbuf + 32 + aper * s, dim, nc, (int) rows, (int) cols, v3, dx, dy, best, 1, &ms)) {
             fprintf(stderr, "stage %u final gemv: %s\n", s, vqg_decode_error());
             return 1;
         }
@@ -407,13 +435,14 @@ int main(int argc, char ** argv) {
     printf("shape       %u x %u, %u stage(s), %.4f bits/weight\n",
            rows, cols, stages, (double) n * 8.0 / ((double) rows * cols));
     printf("container   %zu bytes (%.4f GB)\n", n, gb_container);
-    printf("fused fast  %.4f ms, %.2f GB/s of container\n", fused_ms[2], gb_container / (fused_ms[2] * 1e-3));
-    printf("fused warp  %.4f ms, %.2f GB/s of container\n", fused_ms[1], gb_container / (fused_ms[1] * 1e-3));
-    printf("fused smem  %.4f ms, %.2f GB/s of container\n", fused_ms[0], gb_container / (fused_ms[0] * 1e-3));
+    if (have[3]) printf("fused v3blk %.4f ms, %.2f GB/s of container\n", fused_ms[3], gb_container / (fused_ms[3] * 1e-3));
+    if (have[2]) printf("fused fast  %.4f ms, %.2f GB/s of container\n", fused_ms[2], gb_container / (fused_ms[2] * 1e-3));
+    if (have[1]) printf("fused warp  %.4f ms, %.2f GB/s of container\n", fused_ms[1], gb_container / (fused_ms[1] * 1e-3));
+    if (have[0]) printf("fused smem  %.4f ms, %.2f GB/s of container\n", fused_ms[0], gb_container / (fused_ms[0] * 1e-3));
     printf("dequant     %.4f ms, %.2f GB/s of container\n", dequant_ms, gb_container / (dequant_ms * 1e-3));
     printf("f32 gemv    %.4f ms, %.2f GB/s of f32 weights\n",
            f32_ms, ((double) rows * cols * 4) / 1e9 / (f32_ms * 1e-3));
-    printf("speedup     %.2fx fast vs expand-once-then-multiply\n", f32_ms / fused_ms[2]);
+    printf("speedup     %.2fx best fused vs expand-once-then-multiply\n", f32_ms / fused_ms[best]);
 
     if (check) {
         float * w = malloc((size_t) rows * cols * 4);
