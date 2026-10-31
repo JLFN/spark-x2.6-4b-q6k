@@ -168,6 +168,32 @@ At 1M the same packing changes the verdict on context: 10,368 B/token at a plain
 only a latent scheme in A.X-K2's class (770 B/token, 807 MiB at 1M) would make the
 full window reachable, and Spark has no such compressor.
 
+The measured 1M table, one command per KV assumption (card 12,282 MiB):
+
+    ./bin/plan models/hf --ctx 1048576 --kv q8_0 \
+        --vq 4 2048 1 --vq 4 2048 2 --vq 4 4096 1 --vq 4 4096 2 --vq 8 4096 2 --vq 4 8192 2
+
+    encoding           artifact    weights       KV   buffers     total   headroom
+    VQ 4x2048 x1        1.66 GB     1,584    19,613    1,300    22,497    -10,215
+    VQ 4x2048 x2        2.97 GB     2,828    19,613    1,300    23,740    -11,458
+    VQ 4x4096 x1        1.78 GB     1,700    19,613    1,300    22,613    -10,331
+    VQ 4x4096 x2        3.21 GB     3,060    19,613    1,300    23,972    -11,690
+    VQ 8x4096 x2        1.81 GB     1,723    19,613    1,300    22,635    -10,353
+    VQ 4x8192 x2        3.46 GB     3,298    19,613    1,300    24,211    -11,929
+    Q8_0                4.37 GB     4,167    19,613    1,300    25,080    -12,798
+    Q6_K                3.46 GB     3,295    19,613    1,300    24,208    -11,926
+    Q5_K                2.95 GB     2,817    19,613    1,300    23,729    -11,447
+    Q4_K                2.48 GB     2,367    19,613    1,300    23,279    -10,997
+
+Nothing fits: the KV alone is 19,613 MiB. With a plain 4-bit packed KV
+(--kv-bytes 10368) the VQ build drops to 14,628 MiB, still 2,346 MiB over the card.
+Only a latent KV (--kv-bytes 770) fits: the VQ build lands at 5,030 MiB with 7,252
+MiB spare, and Q6_K at 5,365 MiB.
+
+Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it ranged
+1,079-1,434 MiB. It is not measured at 1M and may grow with context, so treat any
+1M row as a lower bound of a few hundred MiB.
+
 ## 6. What a runnable VQ Spark still needs
 
 1. Encoder pass over the full model. eg2_vq handles one tensor at a time and reads

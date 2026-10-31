@@ -139,7 +139,8 @@ int main(int argc, char ** argv) {
     if (ctx == 0) ctx = 131072;   /* fallback when config.json is absent */
     int kv_q8 = 0, layers = 36, full_layers = 9, kv_heads = 4, head_dim = 256;
     double kv_bytes_per_token = 0.0;   /* >0 overrides the computed KV */
-    int want_vq = 0, vq_dim = 4, vq_nc = 4096, vq_stages = 2, vq_embed = 0, json = 0;
+    int vq_n = 0, vq_embed = 0, json = 0;
+    int vq_dim[8] = {0}, vq_nc[8] = {0}, vq_stages[8] = {0};
     int emb = 0;
     double gpu_mib = 12282.0, budget_mib = 0.0, draft_mib = 0.0;
 
@@ -167,15 +168,19 @@ int main(int argc, char ** argv) {
             fclose(f);
         }
         else if (!strcmp(argv[i], "--vq") && i + 3 < argc) {
-            want_vq = 1; vq_dim = atoi(argv[++i]); vq_nc = atoi(argv[++i]); vq_stages = atoi(argv[++i]);
+            if (vq_n >= 8) { fprintf(stderr, "at most 8 --vq specs\n"); return 2; }
+            vq_dim[vq_n] = atoi(argv[++i]); vq_nc[vq_n] = atoi(argv[++i]); vq_stages[vq_n] = atoi(argv[++i]);
+            vq_n++;
         }
         else if (!strcmp(argv[i], "--vq-embed")) vq_embed = 1;
         else if (!strcmp(argv[i], "--json")) json = 1;
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
-    if (want_vq && (vq_dim <= 0 || vq_nc <= 1 || vq_stages < 1)) {
-        fprintf(stderr, "--vq needs dim nc stages, all positive\n");
-        return 2;
+    for (int i = 0; i < vq_n; i++) {
+        if (vq_dim[i] <= 0 || vq_nc[i] <= 1 || vq_stages[i] < 1) {
+            fprintf(stderr, "--vq needs dim nc stages, all positive\n");
+            return 2;
+        }
     }
 
     v41_st S;
@@ -207,10 +212,11 @@ int main(int argc, char ** argv) {
 
     enc_t encs[16];
     int nenc = 0;
-    if (want_vq) {
-        snprintf(encs[nenc].name,   sizeof encs[nenc].name, "VQ %dx%d x%d", vq_dim, vq_nc, vq_stages);
-        encs[nenc].vq = 1; encs[nenc].dim = vq_dim; encs[nenc].nc = vq_nc;
-        encs[nenc].stages = vq_stages; encs[nenc].block = 0; encs[nenc].block_bytes = 0;
+    for (int i = 0; i < vq_n; i++) {
+        snprintf(encs[nenc].name, sizeof encs[nenc].name, "VQ %dx%d x%d%s",
+                 vq_dim[i], vq_nc[i], vq_stages[i], vq_embed ? " emb" : "");
+        encs[nenc].vq = 1; encs[nenc].dim = vq_dim[i]; encs[nenc].nc = vq_nc[i];
+        encs[nenc].stages = vq_stages[i]; encs[nenc].block = 0; encs[nenc].block_bytes = 0;
         encs[nenc].emb = vq_embed ? 3 : emb;
         nenc++;
     }
