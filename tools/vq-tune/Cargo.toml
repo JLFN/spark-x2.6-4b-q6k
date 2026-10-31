@@ -1,0 +1,11 @@
+[package]
+name = "vq-tune"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Per-model, per-kernel autotuner for the VQ decode and prefill kernels"
+build = "build.rs"
+
+[[bin]]
+name = "vq-tune"
+path = "src/main.rs"

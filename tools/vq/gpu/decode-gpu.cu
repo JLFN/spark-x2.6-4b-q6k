@@ -90,7 +90,16 @@ __device__ __forceinline__ uint32_t rd_idx(const uint8_t * s, size_t i, int nbit
 
 /* Format-aware index read: DQVQ numbers bits across the whole matrix, DQV3
  * restarts the 12-bit stream at every row and carries the 13th bit in a plane
- * (ds41_vq_row.cuh:7-20, :122-137). */
+ * (ds41_vq_row.cuh:7-20, :122-137).
+ *
+ * Read window: every index is read as an aligned 4-byte window (the tiled
+ * prefill reads 8 bytes), so the last index of the last row can reach up to 7
+ * bytes past the payload's end. That is deliberate: it keeps the inner loops
+ * branch-free and the window is discarded after masking. The contract is on
+ * the caller: a device stage buffer must carry 8 bytes of slack past the
+ * container's payload bytes, zeroed. Every allocator in this repository does
+ * (vq-model-gpu.c: load_mat, vq-tune: kernels::upload, vq-bench: cuda.rs), and
+ * compute-sanitizer is what proved it necessary. */
 __device__ __forceinline__ uint32_t rd_idx_fmt(const uint8_t * st, const layout & L, size_t r, size_t i) {
     if (!L.v3) return rd_idx(st, r * (size_t) (L.cols / L.dim) + i, L.nbit, L.mask);
     /* The v3 main stream is min(bit_width, 12) bits wide (build-vq-gpu.c:59
@@ -313,14 +322,21 @@ __global__ void gemv_v3blk_kernel(const uint8_t * p, const layout L, const float
  * core's own f32 adder truncates low bits on alignment instead of rounding).
  */
 #define PRE_BM      128
-#define PRE_BN      128
-#define PRE_BK      64
 #define PRE_THREADS 512
 
-/* A tile row is 64 f16 = 8 chunks of 16 B; chunk ^ (row & 7) spreads the 8
- * rows ldmatrix reads at once over 8 bank groups (ds4 :83). */
-__device__ __forceinline__ uint32_t pre_swz(uint32_t row, uint32_t chunk) {
-    return row * 128u + ((chunk ^ (row & 7u)) << 4);
+/* BN and BK are template parameters: the tuner picks them per matrix geometry
+ * (vqg_prefill_cfg_* below). BM stays 128 because the 16-warp mapping is
+ * 8 row slabs of 16 rows (wr = warp & 7), and the thread count stays 512
+ * because th = warp >> 3 gives exactly the two column halves the mma loop
+ * assumes. BK is 64 or 128: the XOR swizzle below permutes the chunks inside
+ * one row, which needs BK*2 bytes of row to be a multiple of the 16-byte chunk
+ * and at least 8 chunks, so BK 32 would make chunk ^ (row & 7) leave the row. */
+
+/* A tile row is BK f16 = BK/8 chunks of 16 B; chunk ^ (row & 7) spreads the 8
+ * rows ldmatrix reads at once over 8 bank groups (ds4 :83). `stride` is the
+ * row's byte stride, BK*2. */
+__device__ __forceinline__ uint32_t pre_swz(uint32_t row, uint32_t chunk, uint32_t stride) {
+    return row * stride + ((chunk ^ (row & 7u)) << 4);
 }
 
 __device__ __forceinline__ void pre_ldsm4(uint32_t * r, const uint8_t * p) {
@@ -340,16 +356,18 @@ __device__ __forceinline__ uint32_t pre_h2u(__half2 h) { return *reinterpret_cas
 
 /* CB 0 keeps the codebook in global (it is 32-64 KB: it stays in L1 under
  * three resident blocks), CB 1 stages it in shared behind the two tiles. */
-template <int CB, int DIM>
+template <int BN, int BK, int CB, int DIM>
 __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
         const uint8_t * p, const layout L, const float * xT, int ntok, float * y) {
-    constexpr uint32_t CW  = PRE_BK / (uint32_t) DIM;    /* code words per row-round: 16 (dim 4), 8 (dim 8) */
+    constexpr uint32_t CW  = BK / (uint32_t) DIM;        /* code words per row-round: 16 (dim 4), 8 (dim 8) */
     constexpr uint32_t TPR = 4u, CPT = CW / TPR;         /* 4 threads per row, 4 / 2 code words each */
-    constexpr uint32_t NFW = PRE_BN / 16u;               /* n8 slices per warp (8) */
-    constexpr uint32_t NCH = PRE_BN * 8u / PRE_THREADS;  /* B-tile 16 B chunks per thread (2) */
+    constexpr uint32_t NFW = BN / 16u;                   /* n8 slices per warp (8) */
+    constexpr uint32_t CPL = BK / 8u;                    /* 16 B chunks per tile row: 8 (BK 64), 16 (BK 128) */
+    constexpr uint32_t NCH = BN * CPL / PRE_THREADS;     /* B-tile chunks per thread */
+    constexpr uint32_t STR = BK * 2u;                    /* tile row stride in bytes */
     extern __shared__ __align__(16) uint8_t sh[];
-    uint8_t * As = sh, * Bs = sh + PRE_BM * PRE_BK * 2u;
-    uint8_t * cbs = Bs + PRE_BN * PRE_BK * 2u;
+    uint8_t * As = sh, * Bs = sh + PRE_BM * STR;
+    uint8_t * cbs = Bs + BN * STR;
     const __half * cb = (const __half *) (p + L.cb_off);
     const __half * gr = (const __half *) (p + L.gain_off);
     const uint8_t * st = p + L.stream_off;
@@ -365,9 +383,9 @@ __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
     }
 
     const uint32_t ar = tid / TPR, sub = tid % TPR;      /* A-tile row this thread fills */
-    const int r0 = (int) blockIdx.x * PRE_BM, t0 = (int) blockIdx.y * PRE_BN;
-    const int nt = min(PRE_BN, ntok - t0);
-    const int nrnd = (int) (L.cols / PRE_BK);
+    const int r0 = (int) blockIdx.x * PRE_BM, t0 = (int) blockIdx.y * BN;
+    const int nt = min((int) BN, ntok - t0);
+    const int nrnd = (int) (L.cols / BK);
     const bool rv = r0 + (int) ar < L.rows;
     const uint32_t rsrc = (uint32_t) (rv ? r0 + (int) ar : 0);
     const uint8_t * rowp = st + (size_t) rsrc * L.mrow;
@@ -396,10 +414,10 @@ __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
         uint4 bx[NCH];
         #pragma unroll
         for (uint32_t c = 0; c < NCH; c++) {
-            const uint32_t ch = tid + c * PRE_THREADS, t = ch >> 3, cc = ch & 7u;
+            const uint32_t ch = tid + c * PRE_THREADS, t = ch / CPL, cc = ch % CPL;
             bx[c] = make_uint4(0, 0, 0, 0);
             if ((int) t < nt) {
-                const float * s = xT + (size_t) ((uint32_t) i * PRE_BK + cc * 8u) * (size_t) ntok
+                const float * s = xT + (size_t) ((uint32_t) i * BK + cc * 8u) * (size_t) ntok
                                 + (size_t) (t0 + (int) t);
                 const size_t S = (size_t) ntok;
                 bx[c].x = pre_h2u(__floats2half2_rn(s[0], s[S]));
@@ -419,12 +437,12 @@ __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
             if (DIM == 4) {   /* 8-byte code word: half of a 16 B chunk */
                 const uint8_t * src = CB ? cbs + (size_t) v * 8u : (const uint8_t *) cb + (size_t) v * 8u;
                 const uint2 cw = CB ? *(const uint2 *) src : __ldg((const uint2 *) src);
-                *(uint2 *) (As + pre_swz(ar, j >> 1) + ((j & 1u) << 3)) = cw;
+                *(uint2 *) (As + pre_swz(ar, j >> 1, STR) + ((j & 1u) << 3)) = cw;
             } else {   /* dim 8: one code word is one 16 B chunk, two aligned 8 B halves */
                 const uint8_t * src = CB ? cbs + (size_t) v * 16u : (const uint8_t *) cb + (size_t) v * 16u;
                 const uint2 lo = CB ? *(const uint2 *) src : __ldg((const uint2 *) src);
                 const uint2 hi = CB ? *(const uint2 *) (src + 8u) : __ldg((const uint2 *) (src + 8u));
-                uint8_t * dst = As + pre_swz(ar, j);
+                uint8_t * dst = As + pre_swz(ar, j, STR);
                 *(uint2 *) dst = lo;
                 *(uint2 *) (dst + 8u) = hi;
             }
@@ -432,22 +450,22 @@ __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
         #pragma unroll
         for (uint32_t c = 0; c < NCH; c++) {
             const uint32_t ch = tid + c * PRE_THREADS;
-            *(uint4 *) (Bs + pre_swz(ch >> 3, ch & 7u)) = bx[c];
+            *(uint4 *) (Bs + pre_swz(ch / CPL, ch % CPL, STR)) = bx[c];
         }
         __syncthreads();
 
         /* The warp's 16 rows over this half's n8 slices. */
         #pragma unroll
-        for (uint32_t kk = 0; kk < PRE_BK / 16u; kk++) {
+        for (uint32_t kk = 0; kk < BK / 16u; kk++) {
             const uint32_t mt = lane >> 3;
             uint32_t a[4];
-            pre_ldsm4(a, As + pre_swz(wr * 16u + (lane & 7u) + (mt & 1u) * 8u, kk * 2u + (mt >> 1)));
+            pre_ldsm4(a, As + pre_swz(wr * 16u + (lane & 7u) + (mt & 1u) * 8u, kk * 2u + (mt >> 1), STR));
             #pragma unroll
             for (uint32_t np = 0; np < NFW / 2u; np++) {
                 const uint32_t f0 = th * NFW + 2u * np;
                 if ((int) (f0 * 8u) >= nt) break;
                 uint32_t b[4];
-                pre_ldsm4(b, Bs + pre_swz((f0 + (mt >> 1)) * 8u + (lane & 7u), kk * 2u + (mt & 1u)));
+                pre_ldsm4(b, Bs + pre_swz((f0 + (mt >> 1)) * 8u + (lane & 7u), kk * 2u + (mt & 1u), STR));
                 float t0v[4] = {0.f, 0.f, 0.f, 0.f};
                 pre_mma(t0v, a, b[0], b[1]);
                 #pragma unroll
@@ -482,21 +500,61 @@ __global__ __launch_bounds__(PRE_THREADS, 1) void gemm_tiled_kernel(
     }
 }
 
-/* Shared bytes a tiled-prefill launch needs: the two 16 KB tiles, plus the
- * codebook when it is staged (CB 1). */
-static size_t pre_smem(const layout & L, int cb) {
-    return (size_t) (PRE_BM + PRE_BN) * PRE_BK * 2u + (cb ? (size_t) L.nc * L.dim * 2u : 0u);
+/* Largest dynamic shared-memory window the device accepts; the shared-codebook
+ * variant needs nc*dim f16 in one block, which a wide codebook cannot fit. */
+static size_t smem_max(void) {
+    static size_t v = 0;
+    if (!v) {
+        int x = 0;
+        v = (cudaDeviceGetAttribute(&x, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0) == cudaSuccess && x > 0)
+            ? (size_t) x : (size_t) (48 * 1024);
+    }
+    return v;
+}
+
+/* Shared bytes a tiled-prefill launch needs: the two tiles, plus the codebook
+ * when it is staged (CB 1). */
+static size_t pre_smem(int bn, int bk, const layout & L, int cb) {
+    return (size_t) (PRE_BM + bn) * bk * 2u + (cb ? (size_t) L.nc * L.dim * 2u : 0u);
 }
 
 /* Geometry the tiled kernel can take: a DQV3 payload (the round map reads the
  * row-local stream; DQVQ numbers its bits across the whole matrix), dim 4 or 8
  * (the 4-thread-per-row split assumes 2 or 4 code words each), a 12-bit main
- * stream (nc >= 4096), whole 64-column rounds, and a row stream whose 4-byte
- * loads are aligned (cols/64 whole implies it; the check is on the derived
+ * stream (nc >= 4096), whole bk-column rounds, and a row stream whose 4-byte
+ * loads are aligned (cols/bk whole implies it; the check is on the derived
  * width, not on the caller's promise). */
-static int pre_ok(const layout & L) {
+static int pre_ok(const layout & L, int bk) {
     return L.v3 && (L.dim == 4 || L.dim == 8) && L.rows > 0 && L.cols > 0 && L.nbit >= 12
-        && L.cols % PRE_BK == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
+        && L.cols % bk == 0 && L.mrow % 4 == 0 && L.stream_off % 4 == 0;
+}
+
+/* The tile shapes the tuner may choose: BN is the token tile, BK the column
+ * round. Both must satisfy the kernel's swizzle and warp mapping (see the
+ * comment above pre_swz), and BN*BK must divide evenly across the 512 threads.
+ * BM and the thread count stay fixed, which is why they are not here.
+ *
+ * BK is 64 only. The A-tile fill extracts CPT = BK/(4*DIM) code words from one
+ * 64-bit window, which is exactly 4 code words (48 bits) at BK 64; BK 128
+ * needs 8 (96 bits) and would silently truncate. A 96-bit window (three words
+ * and a funnel shift, the shape v3_rounds already uses) is the extension that
+ * would add BK 128; it is not a shape this build can run correctly, so it is
+ * not offered. */
+static const struct { int bn, bk; } k_pre_cfg[] = {
+    { 64, 64},
+    {128, 64},
+    {256, 64},
+};
+#define PRE_NCFG ((int) (sizeof k_pre_cfg / sizeof k_pre_cfg[0]))
+
+/* Whether one tile shape can run this geometry. cb is the codebook placement
+ * (0 = global/L1, 1 = shared), so a shared codebook that does not fit the
+ * device's opt-in window disqualifies only that placement. */
+static int pre_cfg_ready(const layout & L, int bn, int bk, int cb) {
+    if (!pre_ok(L, bk)) return 0;
+    if (cb && pre_smem(bn, bk, L, 1) > smem_max()) return 0;
+    (void) bn;
+    return 1;
 }
 
 /* Prefill: one thread per (row, token). The row's indices are staged in shared
@@ -618,22 +676,22 @@ __global__ void gemv_f32_kernel(const float * w, const float * x, float * y, int
     if (threadIdx.x == 0) y[r] += red[0];
 }
 
-template <int CB, int DIM>
+template <int BN, int BK, int CB, int DIM>
 static int pre_tiled(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y,
                      int iters, double * ms) {
-    const size_t smem = pre_smem(L, CB);
-    if (cudaFuncSetAttribute(gemm_tiled_kernel<CB, DIM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) smem) != cudaSuccess)
+    const size_t smem = pre_smem(BN, BK, L, CB);
+    if (cudaFuncSetAttribute(gemm_tiled_kernel<BN, BK, CB, DIM>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) != cudaSuccess)
         return fail("prefill shared memory opt-in", cudaGetLastError());
     const dim3 grid((unsigned) ((L.rows + PRE_BM - 1) / PRE_BM),
-                    (unsigned) ((ntok + PRE_BN - 1) / PRE_BN));
+                    (unsigned) ((ntok + BN - 1) / BN));
     cudaEvent_t a, b;
     if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess)
         return fail("event create", cudaGetLastError());
     float best = 1e30f;
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(a);
-        gemm_tiled_kernel<CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
+        gemm_tiled_kernel<BN, BK, CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
         cudaEventRecord(b);
         if (cudaEventSynchronize(b) != cudaSuccess) return fail("prefill launch", cudaGetLastError());
         float t = 0;
@@ -651,33 +709,76 @@ static int pre_tiled(const uint8_t * p, const layout & L, const float * xT, int 
  * after the whole prompt, so a timing wrapper would cost 216 synchronizations
  * per chunk. The shared-memory opt-in is monotone per instantiation: it only
  * has to grow, and the largest matrix's window covers every smaller one. */
-template <int CB, int DIM>
+template <int BN, int BK, int CB, int DIM>
 static int pre_launch_impl(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y) {
     static size_t opted = 0;
-    const size_t smem = pre_smem(L, CB);
+    const size_t smem = pre_smem(BN, BK, L, CB);
     if (smem > opted) {
-        if (cudaFuncSetAttribute(gemm_tiled_kernel<CB, DIM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int) smem) != cudaSuccess)
+        if (cudaFuncSetAttribute(gemm_tiled_kernel<BN, BK, CB, DIM>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) != cudaSuccess)
             return fail("prefill shared memory opt-in", cudaGetLastError());
         opted = smem;
     }
     const dim3 grid((unsigned) ((L.rows + PRE_BM - 1) / PRE_BM),
-                    (unsigned) ((ntok + PRE_BN - 1) / PRE_BN));
-    gemm_tiled_kernel<CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
+                    (unsigned) ((ntok + BN - 1) / BN));
+    gemm_tiled_kernel<BN, BK, CB, DIM><<<grid, PRE_THREADS, smem>>>(p, L, xT, ntok, y);
     return 0;
+}
+
+/* The tile shape is a runtime choice, so the dispatch is a table over the
+ * instantiations above. A shape not in the table is an error, never a silent
+ * fallback to the default. */
+#define PRE_DISPATCH_TIMED(BN_, BK_, CB_)                                            \
+    if (bn == (BN_) && bk == (BK_) && cb == (CB_))                                   \
+        return L.dim == 4 ? pre_tiled<BN_, BK_, CB_, 4>(p, L, xT, ntok, y, iters, ms) \
+                          : pre_tiled<BN_, BK_, CB_, 8>(p, L, xT, ntok, y, iters, ms);
+
+static int pre_tiled_cfg(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y,
+                         int iters, double * ms, int bn, int bk, int cb) {
+    PRE_DISPATCH_TIMED(64, 64, 0)
+    PRE_DISPATCH_TIMED(128, 64, 0)
+    PRE_DISPATCH_TIMED(256, 64, 0)
+    PRE_DISPATCH_TIMED(64, 64, 1)
+    PRE_DISPATCH_TIMED(128, 64, 1)
+    PRE_DISPATCH_TIMED(256, 64, 1)
+    snprintf(g_err, sizeof g_err, "unknown prefill tile %dx%d with codebook placement %d", bn, bk, cb);
+    return -1;
+}
+
+#define PRE_DISPATCH_LAUNCH(BN_, BK_, CB_)                                            \
+    if (bn == (BN_) && bk == (BK_) && cb == (CB_))                                    \
+        return L.dim == 4 ? pre_launch_impl<BN_, BK_, CB_, 4>(p, L, xT, ntok, y)      \
+                          : pre_launch_impl<BN_, BK_, CB_, 8>(p, L, xT, ntok, y);
+
+static int pre_launch_cfg(const uint8_t * p, const layout & L, const float * xT, int ntok, float * y,
+                          int bn, int bk, int cb) {
+    PRE_DISPATCH_LAUNCH(64, 64, 0)
+    PRE_DISPATCH_LAUNCH(128, 64, 0)
+    PRE_DISPATCH_LAUNCH(256, 64, 0)
+    PRE_DISPATCH_LAUNCH(64, 64, 1)
+    PRE_DISPATCH_LAUNCH(128, 64, 1)
+    PRE_DISPATCH_LAUNCH(256, 64, 1)
+    snprintf(g_err, sizeof g_err, "unknown prefill tile %dx%d with codebook placement %d", bn, bk, cb);
+    return -1;
 }
 
 extern "C" {
 
-/* Largest dynamic shared-memory window the device accepts; the shared-codebook
- * variant needs nc*dim f16 in one block, which a wide codebook cannot fit. */
-static size_t smem_max(void) {
-    static size_t v = 0;
-    if (!v) {
-        int x = 0;
-        v = (cudaDeviceGetAttribute(&x, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0) == cudaSuccess && x > 0)
-            ? (size_t) x : (size_t) (48 * 1024);
-    }
+/* The device name a tuning profile is bound to; the runtime refuses a profile
+ * measured on another device rather than applying its launch shapes blind. */
+int vqg_device_name(char * out, int n) {
+    cudaDeviceProp p;
+    memset(&p, 0, sizeof p);
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess || n <= 0) return fail("device properties", cudaGetLastError());
+    snprintf(out, (size_t) n, "%s", p.name);
+    return 0;
+}
+
+/* Driver version as CUDA reports it (major * 1000 + minor * 10), recorded in
+ * the profile so a driver change is visible when a profile is re-read. */
+int vqg_driver_version(void) {
+    int v = 0;
+    if (cudaDriverGetVersion(&v) != cudaSuccess) return -1;
     return v;
 }
 
@@ -699,9 +800,17 @@ int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant) {
  * issues a chain of these per token and synchronizes once, so the chain costs
  * one sync, not one per matrix. variant 0 picks the fastest kernel the
  * geometry supports; the shared-codebook variant is not offered here because
- * it needs its dynamic shared-memory opt-in before the loop starts. */
-static int gemv_launch(const uint8_t * p, const layout & L, const float * x, float * y, int variant) {
-    const int threads = 256;
+ * it needs its dynamic shared-memory opt-in before the loop starts.
+ *
+ * `threads` is the launch width for the warp-per-row kernels (variants 1-3).
+ * It changes only how many warps share a block, never the arithmetic, so the
+ * tuner may pick it per geometry. */
+static int gemv_launch(const uint8_t * p, const layout & L, const float * x, float * y,
+                       int variant, int threads) {
+    if (threads < 32 || threads > 1024 || threads % 32) {
+        snprintf(g_err, sizeof g_err, "gemv launch width %d is not a warp multiple up to 1024", threads);
+        return -1;
+    }
     if (variant == 0) variant = v3_blk_ok(L) ? 3 : (L.dim == 4 ? 2 : 1);
     const int blocks = (L.rows * 32 + threads - 1) / threads;
     if (variant == 3) {
@@ -749,27 +858,41 @@ int vqg_dequant(const void * payload, int dim, int nc, int rows, int cols, int v
 }
 
 /* Fused gather+dot per stage, accumulated into y (device pointer, rows).
- * variant 0 = shared-memory codebook, 1 = warp per row with the table in L1. */
-int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
-             const float * x, float * y, int variant, int iters, double * ms) {
+ * variant 0 = shared-memory codebook (fixed 256-thread reduction), 1 = warp
+ * per row with the table in L1, 2 = the dim-4 unrolled warp kernel, 3 = the
+ * DQV3 block kernel. The tuner uses this timed form to price each variant at
+ * each launch width; a runtime uses vqg_gemv_launch_t. */
+int vqg_gemv_t(const void * payload, int dim, int nc, int rows, int cols, int v3,
+               const float * x, float * y, int variant, int threads, int iters, double * ms) {
     if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "gemv needs a non-empty matrix"); return -1; }
+    if (variant < 0 || variant > 3) { snprintf(g_err, sizeof g_err, "unknown gemv variant %d", variant); return -1; }
     const layout L = make_layout(dim, nc, rows, cols, v3);
-    const int threads = 256;
-    const size_t smem = (variant == 0) ? (size_t) L.nc * L.dim * 2 : 0;
-    const int blocks = (variant == 0)
-        ? (L.rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK
-        : (L.rows * 32 + threads - 1) / threads;
-    if (smem > 48 * 1024 &&
-        cudaFuncSetAttribute(gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) != cudaSuccess)
-        return fail("shared memory opt-in", cudaGetLastError());
+    const uint8_t * p = (const uint8_t *) payload;
+    int thr = threads, blocks;
+    size_t smem = 0;
+    if (variant == 0) {
+        thr = 256;   /* gemv_kernel's reduction array is 256 entries wide */
+        blocks = (L.rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        smem = (size_t) L.nc * L.dim * 2;
+        if (smem > 48 * 1024 &&
+            cudaFuncSetAttribute(gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) != cudaSuccess)
+            return fail("shared memory opt-in", cudaGetLastError());
+    } else {
+        if (thr < 32 || thr > 1024 || thr % 32) {
+            snprintf(g_err, sizeof g_err, "gemv launch width %d is not a warp multiple up to 1024", thr);
+            return -1;
+        }
+        blocks = (L.rows * 32 + thr - 1) / thr;
+    }
     cudaEvent_t a, b;
     if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess)
         return fail("event create", cudaGetLastError());
     float best = 1e30f;
     for (int it = 0; it < iters; it++) {
         cudaEventRecord(a);
-        if (variant == 0)      gemv_kernel<<<blocks, threads, smem>>>((const uint8_t *) payload, L, x, y);
-        else if (gemv_launch((const uint8_t *) payload, L, x, y, variant)) return -1;
+        if (variant == 0) gemv_kernel<<<blocks, thr, smem>>>(p, L, x, y);
+        else if (gemv_launch(p, L, x, y, variant, thr)) return -1;
         cudaEventRecord(b);
         if (cudaEventSynchronize(b) != cudaSuccess) return fail("gemv launch", cudaGetLastError());
         float t = 0;
@@ -782,13 +905,26 @@ int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
     return 0;
 }
 
+int vqg_gemv(const void * payload, int dim, int nc, int rows, int cols, int v3,
+             const float * x, float * y, int variant, int iters, double * ms) {
+    return vqg_gemv_t(payload, dim, nc, rows, cols, v3, x, y, variant, 256, iters, ms);
+}
+
 /* One GEMV launch for a caller that already checked the geometry, with no
- * timing and no synchronization (see gemv_launch). variant 0 = auto. */
+ * timing and no synchronization (see gemv_launch). variant 0 = auto; the
+ * profile-selected width arrives through this form. */
+int vqg_gemv_launch_t(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                      const float * x, float * y, int variant, int threads) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "gemv needs a non-empty matrix"); return -1; }
+    return gemv_launch((const uint8_t *) payload, make_layout(dim, nc, rows, cols, v3), x, y, variant, threads);
+}
+
 int vqg_gemv_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
                     const float * x, float * y, int variant) {
     if (v3 && !v3_width_ok(nc)) return bad_width(nc);
     if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "gemv needs a non-empty matrix"); return -1; }
-    return gemv_launch((const uint8_t *) payload, make_layout(dim, nc, rows, cols, v3), x, y, variant);
+    return gemv_launch((const uint8_t *) payload, make_layout(dim, nc, rows, cols, v3), x, y, variant, 256);
 }
 
 /* Rebuild one row of one stage into out (device pointer, accumulated). The
@@ -850,19 +986,42 @@ static int pre_legacy(const void * payload, int dim, int nc, int rows, int cols,
 
 /* Whether a prefill path can run on this geometry:
  *   0 = auto (the fastest one this geometry supports)
- *   1 = tiled f16 mma, codebook through L1
- *   2 = tiled f16 mma, codebook staged in shared (needs the opt-in window)
+ *   1 = tiled f16 mma, codebook through L1, default 128x64 tile
+ *   2 = tiled f16 mma, codebook staged in shared (needs the opt-in window),
+ *       default 128x64 tile
  *   3 = legacy one-thread-per-(row, token) kernel (any geometry)
- */
+ * Variants 1 and 2 also answer for their default tile only; a caller that
+ * wants another tile asks vqg_prefill_cfg_ready. */
 int vqg_prefill_ready(int dim, int nc, int rows, int cols, int v3, int variant) {
     const layout L = make_layout(dim, nc, rows, cols, v3);
     switch (variant) {
         case 0: return 1;
-        case 1: return pre_ok(L);
-        case 2: return pre_ok(L) && pre_smem(L, 1) <= smem_max();
+        case 1: return pre_cfg_ready(L, 128, 64, 0);
+        case 2: return pre_cfg_ready(L, 128, 64, 1);
         case 3: return 1;
         default: return 0;
     }
+}
+
+/* The tile shapes the tuner may ask for. Iterating the table rather than
+ * hardcoding shapes into the tuner keeps one list of what this build can run. */
+int vqg_prefill_cfg_count(void) { return PRE_NCFG; }
+
+int vqg_prefill_cfg(int idx, int * bn, int * bk) {
+    if (idx < 0 || idx >= PRE_NCFG || !bn || !bk) return -1;
+    *bn = k_pre_cfg[idx].bn;
+    *bk = k_pre_cfg[idx].bk;
+    return 0;
+}
+
+/* Whether one explicit tile can run this geometry. variant 1 stages the
+ * codebook in L1, variant 2 in shared; variant 3 is the legacy kernel and
+ * ignores the tile. */
+int vqg_prefill_cfg_ready(int dim, int nc, int rows, int cols, int v3, int bn, int bk, int variant) {
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    if (variant == 3) return 1;
+    if (variant != 1 && variant != 2) return 0;
+    return pre_cfg_ready(L, bn, bk, variant == 2);
 }
 
 /* Prefill one stage: xT is [cols][ntok], y is [ntok][rows], both device-side.
@@ -874,18 +1033,30 @@ int vqg_prefill(const void * payload, int dim, int nc, int rows, int cols, int v
     if (ntok <= 0) { snprintf(g_err, sizeof g_err, "prefill needs at least one token"); return -1; }
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const uint8_t * p = (const uint8_t *) payload;
-    if (variant == 0) variant = pre_ok(L) ? 1 : 3;
-    if (variant == 3 || !pre_ok(L)) return pre_legacy(payload, dim, nc, rows, cols, v3, xT, ntok, y, iters, ms);
-    if (variant == 2) {
-        if (pre_smem(L, 1) > smem_max()) { snprintf(g_err, sizeof g_err, "prefill codebook does not fit shared"); return -1; }
-        return L.dim == 4 ? pre_tiled<1, 4>(p, L, xT, ntok, y, iters, ms)
-                          : pre_tiled<1, 8>(p, L, xT, ntok, y, iters, ms);
+    if (variant == 0) variant = pre_cfg_ready(L, 128, 64, 0) ? 1 : 3;
+    if (variant == 3) return pre_legacy(payload, dim, nc, rows, cols, v3, xT, ntok, y, iters, ms);
+    if (variant != 1 && variant != 2) {
+        snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
+        return -1;
     }
-    if (variant == 1)
-        return L.dim == 4 ? pre_tiled<0, 4>(p, L, xT, ntok, y, iters, ms)
-                          : pre_tiled<0, 8>(p, L, xT, ntok, y, iters, ms);
-    snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
-    return -1;
+    return pre_tiled_cfg(p, L, xT, ntok, y, iters, ms, 128, 64, variant == 2);
+}
+
+/* The timed form of one explicit tile: the tuner's measurement entry point. */
+int vqg_prefill_tile(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                     const float * xT, int ntok, float * y, int iters, double * ms,
+                     int bn, int bk, int variant) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (ntok <= 0) { snprintf(g_err, sizeof g_err, "prefill needs at least one token"); return -1; }
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "prefill needs a non-empty matrix"); return -1; }
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    const uint8_t * p = (const uint8_t *) payload;
+    if (variant == 3) return pre_legacy(payload, dim, nc, rows, cols, v3, xT, ntok, y, iters, ms);
+    if ((variant != 1 && variant != 2) || !pre_cfg_ready(L, bn, bk, variant == 2)) {
+        snprintf(g_err, sizeof g_err, "tile %dx%d with variant %d does not fit this geometry", bn, bk, variant);
+        return -1;
+    }
+    return pre_tiled_cfg(p, L, xT, ntok, y, iters, ms, bn, bk, variant == 2);
 }
 
 /* One prefill launch for a caller that already checked the geometry, with no
@@ -899,8 +1070,8 @@ int vqg_prefill_launch(const void * payload, int dim, int nc, int rows, int cols
     if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "prefill needs a non-empty matrix"); return -1; }
     const layout L = make_layout(dim, nc, rows, cols, v3);
     const uint8_t * p = (const uint8_t *) payload;
-    if (variant == 0) variant = pre_ok(L) ? 1 : 3;
-    if (variant == 3 || !pre_ok(L)) {
+    if (variant == 0) variant = pre_cfg_ready(L, 128, 64, 0) ? 1 : 3;
+    if (variant == 3) {
         const int smem = (int) ((size_t) (L.cols / L.dim) * 2);
         if (smem > 48 * 1024 &&
             cudaFuncSetAttribute(gemm_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -910,16 +1081,39 @@ int vqg_prefill_launch(const void * payload, int dim, int nc, int rows, int cols
         gemm_prefill_kernel<<<grid, PRE_LEGACY_THREADS, smem>>>(p, L, xT, ntok, y);
         return 0;
     }
-    if (variant == 2) {
-        if (pre_smem(L, 1) > smem_max()) { snprintf(g_err, sizeof g_err, "prefill codebook does not fit shared"); return -1; }
-        return L.dim == 4 ? pre_launch_impl<1, 4>(p, L, xT, ntok, y)
-                          : pre_launch_impl<1, 8>(p, L, xT, ntok, y);
+    if (variant != 1 && variant != 2) {
+        snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
+        return -1;
     }
-    if (variant == 1)
-        return L.dim == 4 ? pre_launch_impl<0, 4>(p, L, xT, ntok, y)
-                          : pre_launch_impl<0, 8>(p, L, xT, ntok, y);
-    snprintf(g_err, sizeof g_err, "unknown prefill variant %d", variant);
-    return -1;
+    return pre_launch_cfg(p, L, xT, ntok, y, 128, 64, variant == 2);
+}
+
+/* One launch of an explicit tile, no timing and no synchronization. This is
+ * what the model runtime calls per matrix per prompt chunk once a tuning
+ * profile has chosen the tile. */
+int vqg_prefill_launch_tile(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                            const float * xT, int ntok, float * y,
+                            int bn, int bk, int variant) {
+    if (v3 && !v3_width_ok(nc)) return bad_width(nc);
+    if (ntok <= 0) { snprintf(g_err, sizeof g_err, "prefill needs at least one token"); return -1; }
+    if (rows <= 0 || cols <= 0) { snprintf(g_err, sizeof g_err, "prefill needs a non-empty matrix"); return -1; }
+    const layout L = make_layout(dim, nc, rows, cols, v3);
+    const uint8_t * p = (const uint8_t *) payload;
+    if (variant == 3) {
+        const int smem = (int) ((size_t) (L.cols / L.dim) * 2);
+        if (smem > 48 * 1024 &&
+            cudaFuncSetAttribute(gemm_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem) != cudaSuccess)
+            return fail("prefill shared memory opt-in", cudaGetLastError());
+        const dim3 grid((unsigned) L.rows, (unsigned) ((ntok + PRE_LEGACY_THREADS - 1) / PRE_LEGACY_THREADS));
+        gemm_prefill_kernel<<<grid, PRE_LEGACY_THREADS, smem>>>(p, L, xT, ntok, y);
+        return 0;
+    }
+    if ((variant != 1 && variant != 2) || !pre_cfg_ready(L, bn, bk, variant == 2)) {
+        snprintf(g_err, sizeof g_err, "tile %dx%d with variant %d does not fit this geometry", bn, bk, variant);
+        return -1;
+    }
+    return pre_launch_cfg(p, L, xT, ntok, y, bn, bk, variant == 2);
 }
 
 int vqg_gemv_f32(const float * w, const float * x, float * y, int rows, int cols, int iters, double * ms) {

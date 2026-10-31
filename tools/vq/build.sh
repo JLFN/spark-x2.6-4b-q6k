@@ -55,7 +55,8 @@ cp "$ROOT/tools/target/release/dqvq" "$ROOT/bin/dqvq"
 cp "$ROOT/tools/target/release/vq-bench" "$ROOT/bin/vq-bench"
 cp "$ROOT/tools/target/release/vq-runtime" "$ROOT/bin/vq-runtime"
 cp "$ROOT/tools/target/release/logits-diff" "$ROOT/bin/logits-diff"
-echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime and $ROOT/bin/logits-diff"
+cp "$ROOT/tools/target/release/vq-tune" "$ROOT/bin/vq-tune"
+echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime, $ROOT/bin/logits-diff and $ROOT/bin/vq-tune"
 
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
@@ -63,7 +64,16 @@ $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
 echo "built $ROOT/bin/quant_err"
 
 # GPU path: device-resident Lloyd and assignment. Needs nvcc.
-NVCC=${NVCC:-/usr/local/cuda-13.3/bin/nvcc}
+# Resolve the toolkit without pinning a version: an explicit NVCC wins, then
+# PATH, then the unversioned /usr/local/cuda symlink. A hardcoded
+# /usr/local/cuda-13.3 breaks the build the day the toolkit is upgraded.
+if [ -z "${NVCC:-}" ]; then
+  if command -v nvcc >/dev/null 2>&1; then
+    NVCC=$(command -v nvcc)
+  else
+    NVCC=/usr/local/cuda/bin/nvcc
+  fi
+fi
 ARCH=${ARCH:-89}
 if [ -x "$NVCC" ]; then
   $NVCC -O3 -std=c++17 -arch=sm_$ARCH -c -o "$OBJ/vq_gpu.o" "$ROOT/tools/vq/gpu/vq_gpu.cu"

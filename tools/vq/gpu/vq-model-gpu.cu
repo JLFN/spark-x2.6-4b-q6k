@@ -49,17 +49,30 @@
 #include <math.h>
 #include <time.h>
 
+#include "vq-profile.h"
+
 extern "C" {
 const char * vqg_decode_error(void);
 int vqg_gemv_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
                     const float * x, float * y, int variant);
+int vqg_gemv_launch_t(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                      const float * x, float * y, int variant, int threads);
 int vqg_gemv_ready(int dim, int nc, int rows, int cols, int v3, int variant);
 int vqg_row_dequant(const void * payload, int dim, int nc, int rows, int cols, int v3,
                     int row, float * out);
 int vqg_prefill_launch(const void * payload, int dim, int nc, int rows, int cols, int v3,
                        const float * xT, int ntok, float * y, int variant);
+int vqg_prefill_launch_tile(const void * payload, int dim, int nc, int rows, int cols, int v3,
+                            const float * xT, int ntok, float * y,
+                            int bn, int bk, int variant);
 int vqg_prefill_ready(int dim, int nc, int rows, int cols, int v3, int variant);
+int vqg_prefill_cfg_ready(int dim, int nc, int rows, int cols, int v3, int bn, int bk, int variant);
 }
+
+/* The tuning profile, when one matched this artifact and device. A zero
+ * g_prof_on keeps the readiness heuristics above (see vq-profile.h). */
+static vqprof g_prof;
+static int g_prof_on = 0;
 
 /* ---------------------------------------------------------------- config -- */
 
@@ -202,6 +215,8 @@ static int parse_config(const char * path, Cfg * c) {
 
 typedef struct {
     int dim, nc, rows, cols, v3, nst, variant, pvariant;
+    int threads;               /* GEMV launch width, from the profile or 256 */
+    int pf_bn, pf_bk;          /* prefill tile, from the profile or 128x64 */
     unsigned char * st[4];
 } Mat;
 
@@ -260,11 +275,17 @@ static int load_mat(const char * dir, const char * name, int want_rows, int want
     m->v3 = v3;
     m->nst = nst;
     for (int s = 0; s < nst; s++) {
-        if (ck(cudaMalloc((void **) &m->st[s], per), "cudaMalloc stage")) { free(buf); return -1; }
+        /* 8 bytes of slack: the kernels read aligned 4- and 8-byte index
+         * windows, and the last index of the last row can reach up to 7 bytes
+         * past the payload (see rd_idx_fmt in decode-gpu.cu). The C driver
+         * carries the same slack; without it compute-sanitizer reports an
+         * out-of-bounds read even though the driver allocator rounds up. */
+        if (ck(cudaMalloc((void **) &m->st[s], per + 8), "cudaMalloc stage")) { free(buf); return -1; }
         if (ck(cudaMemcpy(m->st[s], buf + 32 + per * (size_t) s, per, cudaMemcpyHostToDevice), "stage upload")) {
             free(buf);
             return -1;
         }
+        if (ck(cudaMemset(m->st[s] + per, 0, 8), "pad stage")) { free(buf); return -1; }
     }
     m->variant = vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, 3) ? 3
                 : vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, 2) ? 2 : 1;
@@ -274,6 +295,33 @@ static int load_mat(const char * dir, const char * name, int want_rows, int want
      * treats as "token by token is better for this matrix". */
     m->pvariant = vqg_prefill_ready(dim, nc, (int) rows, (int) cols, v3, 2) ? 2
                 : vqg_prefill_ready(dim, nc, (int) rows, (int) cols, v3, 1) ? 1 : 3;
+    m->threads = 256;
+    m->pf_bn = 128;
+    m->pf_bk = 64;
+    /* A matched profile replaces the heuristic per geometry. Both entries are
+     * re-checked for runnability here, so a hand-edited or stale profile can
+     * lose to the heuristic but can never launch an illegal kernel. */
+    if (g_prof_on) {
+        const vqprof_entry * g = vqprof_find(&g_prof, 0, dim, nc, (int) rows, (int) cols, v3);
+        if (g && (g->variant < 0 || g->variant > 3
+                  || !vqg_gemv_ready(dim, nc, (int) rows, (int) cols, v3, g->variant)
+                  || g->threads < 32 || g->threads > 1024 || g->threads % 32)) {
+            fprintf(stderr, "profile: gemv entry for %dx%d is not runnable here; heuristic kept\n",
+                    (int) rows, (int) cols);
+        } else if (g) {
+            m->variant = g->variant;
+            m->threads = g->threads;
+        }
+        const vqprof_entry * p = vqprof_find(&g_prof, 1, dim, nc, (int) rows, (int) cols, v3);
+        if (p && !vqg_prefill_cfg_ready(dim, nc, (int) rows, (int) cols, v3, p->bn, p->bk, p->variant)) {
+            fprintf(stderr, "profile: prefill entry for %dx%d is not runnable here; heuristic kept\n",
+                    (int) rows, (int) cols);
+        } else if (p) {
+            m->pvariant = p->variant;
+            m->pf_bn = p->bn;
+            m->pf_bk = p->bk;
+        }
+    }
     g_container_bytes += payload;
     free(buf);
     return 0;
@@ -594,7 +642,8 @@ static float * dev_f32(size_t n) {
  * deliberately adds into h. */
 static int gemv(const Mat * m, const float * x, float * y) {
     for (int s = 0; s < m->nst; s++) {
-        if (vqg_gemv_launch(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3, x, y, m->variant)) {
+        if (vqg_gemv_launch_t(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3, x, y,
+                              m->variant, m->threads)) {
             fprintf(stderr, "gemv: %s\n", vqg_decode_error());
             return -1;
         }
@@ -740,8 +789,12 @@ static int forward(Model * m, uint32_t token, int pos) {
 /* One matrix times a chunk of tokens, every stage accumulated into y[ntok][rows]. */
 static int prefill_mat(const Mat * m, const float * xT, int ntok, float * y) {
     for (int s = 0; s < m->nst; s++) {
-        if (vqg_prefill_launch(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3,
-                               xT, ntok, y, m->pvariant)) {
+        const int rc = (m->pvariant == 3)
+            ? vqg_prefill_launch(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3,
+                                 xT, ntok, y, m->pvariant)
+            : vqg_prefill_launch_tile(m->st[s], m->dim, m->nc, m->rows, m->cols, m->v3,
+                                      xT, ntok, y, m->pf_bn, m->pf_bk, m->pvariant);
+        if (rc) {
             fprintf(stderr, "prefill: %s\n", vqg_decode_error());
             return -1;
         }
@@ -858,6 +911,8 @@ static const char * USAGE =
     "  --ctx N           KV cache size in tokens (default 4096)\n"
     "  --chunk N         prompt tokens per prefill launch (default 512)\n"
     "  --no-prefill      run the prompt token by token even when the tiled path fits\n"
+    "  --profile PATH    tuning profile (default DIR/vq-tune.profile when present)\n"
+    "  --no-tune         ignore any tuning profile\n"
     "  --top N           print the N best next tokens (default 5)\n"
     "  --logits FILE     write the last prompt position's f32 logits\n";
 
@@ -889,8 +944,8 @@ static int parse_ids(const char * s, uint32_t ** out, int * n) {
 
 int main(int argc, char ** argv) {
     const char * dir = NULL, * cfg_path = "models/hf/config.json", * ids_arg = NULL;
-    const char * logits_out = NULL;
-    int gen = 0, ctx = 4096, topn = 5, chunk = 512, no_prefill = 0;
+    const char * logits_out = NULL, * profile_arg = NULL;
+    int gen = 0, ctx = 4096, topn = 5, chunk = 512, no_prefill = 0, no_tune = 0;
 
     for (int i = 1; i < argc; i++) {
         const char * a = argv[i];
@@ -902,6 +957,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--ctx") && val) { ctx = atoi(val); i++; }
         else if (!strcmp(a, "--chunk") && val) { chunk = atoi(val); i++; }
         else if (!strcmp(a, "--no-prefill")) { no_prefill = 1; }
+        else if (!strcmp(a, "--profile") && val) { profile_arg = val; i++; }
+        else if (!strcmp(a, "--no-tune")) { no_tune = 1; }
         else if (!strcmp(a, "--top") && val) { topn = atoi(val); i++; }
         else if (!strcmp(a, "--logits") && val) { logits_out = val; i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { fputs(USAGE, stdout); return 0; }
@@ -922,6 +979,37 @@ int main(int argc, char ** argv) {
     uint32_t * ids = NULL;
     int nids = 0;
     if (parse_ids(ids_arg, &ids, &nids)) { fprintf(stderr, "--ids needs at least one token id\n"); return 2; }
+
+    /* The tuning profile is advisory: a missing file, a different format, a
+     * different artifact or a different device all fall back to the readiness
+     * heuristic, each with its own line of explanation. */
+    if (!no_tune) {
+        char def[4096];
+        const char * pf = profile_arg;
+        if (!pf) { snprintf(def, sizeof def, "%s/vq-tune.profile", dir); pf = def; }
+        unsigned long long fp = 0;
+        if (vqprof_artifact(dir, &fp)) {
+            printf("profile     none; %s/manifest.txt could not be fingerprinted\n", dir);
+        } else if (vqprof_load(pf, &g_prof)) {
+            printf("profile     %s is absent or not version %d; using heuristics\n", pf, VQPROF_VERSION);
+        } else if (g_prof.artifact != fp) {
+            printf("profile     %s was tuned on artifact %016llx, this one is %016llx; ignored\n",
+                   pf, g_prof.artifact, fp);
+        } else {
+            cudaDeviceProp prop;
+            memset(&prop, 0, sizeof prop);
+            if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+                printf("profile     device query failed; using heuristics\n");
+            } else if (strcmp(prop.name, g_prof.gpu)) {
+                printf("profile     %s was tuned on %s, this device is %s; ignored\n",
+                       pf, g_prof.gpu, prop.name);
+            } else {
+                g_prof_on = 1;
+                printf("profile     %s matches artifact %016llx on %s (%d entries, driver %s)\n",
+                       pf, fp, prop.name, g_prof.n, g_prof.driver);
+            }
+        }
+    }
 
     const double t_load = now_s();
     Model m;
