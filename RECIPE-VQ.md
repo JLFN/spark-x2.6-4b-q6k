@@ -122,63 +122,47 @@ The Q4_K row is a plain Q4_K, not the official Q4_K_M mix, so it under-predicts
 that file by about 1 GiB; use the Q4_K_M row's real size (3,543,441,312 B) when
 budgeting that artifact.
 
-## 5. KV cost: the runtime's, not the weight encoding's
+## 5. The VQ path reads the checkpoint, not a GGUF
 
-In ds4 the KV is much smaller than in llama.cpp, and that is worth separating from
-the VQ question because it is a property of the runtime, not of the weights.
+The conversion starts from the HF checkpoint in models/hf: 5 safetensors shards,
+model.safetensors.index.json, config.json and the tokenizer files. Every tool in
+tools/vq reads that directly through the vendored ds4_st41 index reader, so no
+GGUF is involved at any point of the VQ pipeline. The tools validate the shards
+by name and shape; the local copy matches the Hub file for file on all five
+weight shards and on every tokenizer/config file.
 
-Measured and recorded in the ds4 tree:
+The context comes from the same config. config.json declares
+max_position_embeddings = 1048576, and plan reads that field, so its default
+window is the model's own 1M rather than a number typed into a script.
 
-| Family | KV layout | Cost |
-|---|---|---|
-| DeepSeek-V4.1 | packed FP4: main KV 512 dims = 256 B nibbles + 32 B E4M3 scales = 288 B per group; index K = 64 B nibbles + 4 B E8M0, padded to 72 B (ds41_kvfmt.h:7-11) | one KV head, 512-dim latent |
-| A.X-K2 (VQ) | 770 bytes per token and layer: a 641-byte latent row plus a 129-byte index key (docs/axk2-vq.md); 61 layers gives 11.47 GiB per 262,144-token bank | ~47 KB per token overall |
-| Beam-VQ | sliding layers keep f16 rings of 512; full layers keep FP8 rows, 2,080 bytes per token and layer (docs/beam-vq.md:48) | 18.28 GiB at 1M |
+The attention geometry, also from config.json:
 
-That compactness comes from those families' latent or compressed KV designs and
-their kernels. It is not produced by the weight VQ: the same packed KV would serve
-a Q6_K build of the same model.
+| Field | Value |
+|---|---|
+| num_hidden_layers | 36 |
+| num_attention_heads / num_key_value_heads | 16 / 4 |
+| head_dim | 256 |
+| layer_types | 27 sliding_attention, 9 full_attention |
+| sliding_window | 512 |
+| max_position_embeddings | 1,048,576 |
 
-Spark has 4 KV heads of 256 dims, K and V, on 9 full-attention layers, so a
-token costs 2,048 elements per full layer whatever the weights are. Packed like
-ds4's FP4 that is about 1,152 B per token per layer, 10,368 B per token for the
-whole model, about 1.30 GiB at 128K. A 770-B/token latent like A.X-K2 would need
-a trained compressor that Spark does not have.
+That decides the KV: nine full layers hold the whole window, so at 1,048,576
+tokens the cache is 9 x 1,048,576 x 2 x 4 x 256 values, which is 38.7 GB at f16
+(36.0 GiB) and 19,613 MiB at q8_0. A plain 4-bit packing is about 10.4 GiB.
 
-plan models this directly: --kv-bytes N replaces the computed KV with a measured
-per-token figure.
+For contrast, and not as a template: DeepSeek-V4.1 in ds4 keeps one KV head with a
+512-dim latent in FP4 with E4M3 scales per 16-token group, carried by four source
+layers, about 890 bytes per token, 0.93 GB at 1M. That is an architectural
+compressor. Spark stores real K and V for nine layers, and no weight encoding
+changes that.
 
-    ./bin/plan models/hf --vq 4 4096 2 --vq-embed --kv-bytes 770 --ctx 131072
-    # VQ 4x4096 x2   3.10 GB   2,960 weights  +  96 KV  + 1,300 buffers = 4,356 MiB
+plan models any of this directly with --kv-bytes N (a whole-model bytes-per-token
+figure):
 
-The model's own limit is 1,048,576 tokens (config.json
-max_position_embeddings), so plan defaults to 1M and only serves a smaller window
-when told to. At 1M the GQA KV is the binding constraint on this card: 19,613 MiB
-at q8_0 and 36,919 MiB at f16, against 12,282 MiB total, so 1M does not fit at
-all with a GQA cache; 131,072 is what this repository actually serves.
+    ./bin/plan models/hf --ctx 1048576 --kv-bytes 890
+    # Q6_K  3.46 GB  weights 3,295  KV 890  buffers 1,300  total 5,485 MiB
 
-So in a runtime that packs its KV, the VQ build would sit at 4,356 MiB rather than
-6,737 MiB, and the KV term stops mattering. Two things follow. The weight saving
-from VQ stays at 335 MiB either way, so it does not become more attractive. And
-the KV saving is available to any Spark runtime that implements a packed KV,
-including one serving the existing Q6_K.
-
-At 1M the same packing changes the verdict on context: 10,368 B/token at a plain
-4-bit packing is about 10.4 GiB, still too large beside 2,960 MiB of weights, so
-only a latent scheme in the class of DeepSeek V4.1 would make the full window
-reachable, and Spark has no compressor of that kind.
-
-Why the ds4 numbers are so small, and Spark's are not. Spark's own GGUF metadata
-(`spark2_5.attention.*`) declares 36 layers, 4 KV heads, key and value length 256,
-and a sliding_window_pattern with 27 true and 9 false entries, so nine layers keep
-full attention. At 1,048,576 tokens that is 9 x 1,048,576 x 2 x 4 x 256 values:
-38.7 GB at f16 (36.0 GiB) and 19,613 MiB at q8_0. DeepSeek V4.1 instead keeps one
-KV head with a 512-dim latent, packed as FP4 with E4M3 scales per 16-token group,
-and only four source layers carry it (`kv-sources=[2,8,14,20]`); its account is
-about 890 bytes per token, which is 0.93 GB at 1M. That is an architectural
-compressor, not a storage format, and it cannot be applied to Spark's GQA cache.
-
-The measured 1M table, one command per KV assumption (card 12,282 MiB):
+The 1M table from the checkpoint itself, with an ordinary GQA cache:
 
     ./bin/plan models/hf --ctx 1048576 --kv q8_0 \
         --vq 4 2048 1 --vq 4 2048 2 --vq 4 4096 1 --vq 4 4096 2 --vq 8 4096 2 --vq 4 8192 2
@@ -195,10 +179,10 @@ The measured 1M table, one command per KV assumption (card 12,282 MiB):
     Q5_K                2.95 GB     2,817    19,613    1,300    23,729    -11,447
     Q4_K                2.48 GB     2,367    19,613    1,300    23,279    -10,997
 
-Nothing fits: the KV alone is 19,613 MiB. With a plain 4-bit packed KV
-(--kv-bytes 10368) the VQ build drops to 14,628 MiB, still 2,346 MiB over the card.
-Only a latent KV (--kv-bytes 770) fits: the VQ build lands at 5,030 MiB with 7,252
-MiB spare, and Q6_K at 5,365 MiB.
+Nothing fits at 1M on this card with a GQA cache: the KV alone is 19,613 MiB.
+With a 4-bit packed KV (--kv-bytes 10368) the VQ build drops to 14,628 MiB, still
+2,346 MiB over. Only a latent cache in V4.1's class (--kv-bytes 890) fits, and
+that cache does not exist for Spark.
 
 Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it ranged
 1,079-1,434 MiB. It is not measured at 1M and may grow with context, so treat any
