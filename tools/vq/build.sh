@@ -53,7 +53,9 @@ fi
 "$CARGO" build --release --manifest-path "$ROOT/tools/Cargo.toml"
 cp "$ROOT/tools/target/release/dqvq" "$ROOT/bin/dqvq"
 cp "$ROOT/tools/target/release/vq-bench" "$ROOT/bin/vq-bench"
-echo "built $ROOT/bin/dqvq and $ROOT/bin/vq-bench"
+cp "$ROOT/tools/target/release/vq-runtime" "$ROOT/bin/vq-runtime"
+cp "$ROOT/tools/target/release/logits-diff" "$ROOT/bin/logits-diff"
+echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime and $ROOT/bin/logits-diff"
 
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \

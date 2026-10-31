@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["dqvq", "vq-bench"]
+members = ["dqvq", "vq-bench", "vq-format", "vq-runtime"]
 
 # The harness and the decoders are measurement code: build them once, run them
 # many times, and never let a debug build be mistaken for a timing run.

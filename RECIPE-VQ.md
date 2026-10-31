@@ -1,9 +1,12 @@
 # Recipe: a VQ build of Spark-X2.6-4B
 
-Status: encoder in-repo and working; no runnable VQ Spark yet. The measurements
-below are the reason the next step is a decision, not a build order. AGENTS.md
-section 5 carries the fuller sweep, the whole-checkpoint builds and the
-whole-model k-quant comparison measured after this file was written.
+Status: encoder in-repo and working; a CPU f32 reference runtime loads and runs
+the artifacts and is gated against the bf16 checkpoint and against llama.cpp
+(section 8, item 2, and AGENTS.md section 8b). The measurements below are the
+reason the next step is a decision, not a build order, and the runtime did not
+change the verdict on rate. AGENTS.md section 5 carries the fuller sweep, the
+whole-checkpoint builds and the whole-model k-quant comparison measured after
+this file was written.
 
 ## 1. Verdict first
 
@@ -35,8 +38,10 @@ does reach Q5_K-class quality, but it needs about 0.5 bpw more than Q5_K to get
 there. At Q5_K's own 5.50 bpw, two VQ stages sit at 4.88%, a third worse.
 
 At equal memory, Q6_K still wins outright: 6.56 bpw for 1.79%, against 6.02 bpw
-for 3.93%. VQ is therefore dominated on this model at every budget, which is the
-reason the runtime port is not worth starting.
+for 3.93%. VQ is therefore dominated on this model at every budget, which is
+why the runtime port was not started on that evidence. It was started later, on
+the operator's instruction, as a reference implementation (section 8, item 2);
+it does not change this table.
 
 So a VQ Spark lands in Q3_K class at about 3.5 bpw, roughly a 1.8-2.1 GB artifact
 against the 3.46 GB Q6_K, and that estimate is unmeasured. The EmbeddingGemma VQ
@@ -292,7 +297,17 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    /data/embeddinggemma2/RECIPE.md section 4d); the GGUF wrapping must name a
    family the runtime knows.
 
-2. A runtime that decodes VQ. This is the real gap.
+2. A runtime that decodes VQ. A CPU f32 reference now exists
+   (tools/vq-runtime): it loads the bf16 checkpoint or an RQVQ artifact, runs
+   the full Spark2_5 forward pass over token ids, and writes the logits so a
+   second binary (bin/logits-diff) can price the quantization. Gated
+   2026-10-31 on the prompt "The capital of France is": against llama.cpp's
+   bf16 GGUF the top 20 next tokens are the same ids in the same order with
+   log-softmax within 0.011, so the forward pass itself is verified; against
+   bf16, 4x8192 x2 keeps the argmax with logit relL2 11.52% and KL 0.42 nats,
+   and 4x4096 x3 is closer at 9.51% and 0.38. It is a reference, not a speed
+   path: 16.45 GB of f32 weights per token, 2.7-2.9 tok/s, 16.1 GB resident.
+   The speed gap is unchanged:
    - llama.cpp, which runs Spark today, has no codebook type at all: its ftypes
      are F16, Q4_0, Q4_1, Q8_0, Q5_0, Q5_1, Q2_K..Q6_K (include/llama.h:120).
      A VQ Spark on llama.cpp means a new ggml type plus a CUDA GEMV/GEMM path for
@@ -300,6 +315,10 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    - ds4-rs decodes DQVQ, but it has no Spark family: searching its crates for
      spark2_5 returns nothing, and the gemma_vq path is an embedding-only tower.
      This route means a full Spark2_5 family port into ds4.
+   What the reference runtime did settle: the container, the decoder and a
+   correct forward pass are no longer open questions. What remains is speed,
+   and the pieces for it are measured inside this repo (block GEMV at 299 GB/s,
+   tiled prefill at 1742-1897 tok/s, tools/vq/gpu/decode-gpu.cu).
 
 3. MTP / DSpark on top. The draft model reads target hidden states at layers
    2, 10, 18, 25 and 33. Weight format does not matter to the draft; what matters

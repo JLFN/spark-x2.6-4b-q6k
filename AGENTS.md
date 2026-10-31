@@ -14,8 +14,9 @@ Two artifact families live here and they are not the same thing:
 
 - GGUF k-quants (`models/spark26-4b-Q6_K.gguf`, plus Q5_K and Q4_K builds). These
   run in llama.cpp today and are what the server scripts use.
-- VQ weights (per-tensor containers under `models/vq-build*`). Nothing serves
-  these yet; there is no runtime that decodes them.
+- VQ weights (per-tensor containers under `models/vq-build*`). A CPU f32
+  reference runtime reads and runs them (tools/vq-runtime, section 8b). It is
+  correct but reference-grade speed, and no fast VQ runtime exists yet.
 
 Know which one a request is about before acting.
 
@@ -26,7 +27,8 @@ Know which one a request is about before acting.
 Builds `bin/eg2_vq`, `bin/rvq`, `bin/plan`, `bin/quant_err`, `bin/build-vq`
 (CPU) and, when `nvcc` is present at /usr/local/cuda-13.3/bin/nvcc,
 `bin/build-vq-gpu`. Nothing is read from outside the repository except the CUDA
-toolkit and the checkpoint itself.
+toolkit and the checkpoint itself. The cargo workspace adds `bin/dqvq`,
+`bin/vq-bench`, `bin/vq-runtime` and `bin/logits-diff`.
 
 Runtimes are separate: `./tools/runtime/build-runtime.sh` clones and builds the
 two pinned llama.cpp trees into `vendor/` (gitignored).
@@ -386,6 +388,48 @@ What these numbers are not: the matrix cost of one token with no attention, no
 KV read and no sampling. They are the decode rate of the VQ path, not a server
 throughput claim.
 
+## 8b. Run the reference runtime, and gate it against bf16 and llama.cpp
+
+`bin/vq-runtime` is the CPU f32 reference: it loads either the bf16 checkpoint
+or an RQVQ artifact, runs the full Spark2_5 forward pass (36 layers, GQA, the
+sliding windows, the per-head gate, exact erf gelu) and prints the next-token
+distribution or a greedy continuation. It takes token ids, never text:
+
+    IDS=$(curl -s http://127.0.0.1:8091/tokenize -H 'Content-Type: application/json' \
+          -d '{"content":"The capital of France is","add_special":false}' \
+          | sed -n 's/.*"tokens":\[\([^]]*\)\].*/\1/p')
+    ./bin/vq-runtime --weights hf --dir models/hf --ids "$IDS" --gen 8 --logits /tmp/hf.f32
+    ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids "$IDS" --gen 8 --logits /tmp/vq.f32
+    ./bin/logits-diff /tmp/hf.f32 /tmp/vq.f32 --top 20
+
+`logits-diff` prints the argmax agreement, logit relL2, cosine, both KL
+directions, top-k overlap and the top ids with raw logit and log-softmax value.
+It exits 0 when the argmax agrees, 1 when it does not, 2 on an error.
+
+Measured 2026-10-31, prompt [1046, 11862, 314, 17349, 390] ("The capital of
+France is", 5 tokens; the id list llama.cpp tokenizes with add_special false),
+greedy:
+
+| comparison | result |
+|---|---|
+| forward vs llama.cpp bf16 GGUF | top-20 ids identical, same order; log-softmax within 0.011 (19500: -0.8606 against -0.8592) |
+| 4x8192 x2 vs bf16 | argmax 19500 both; logit relL2 11.52%, cosine 0.99896, KL 0.42 nats, top-10 5/10 |
+| 4x4096 x3 vs bf16 | argmax 19500 both; logit relL2 9.51%, cosine 0.99915, KL 0.38 nats, top-10 6/10 |
+| load | 28.9 s bf16 (7.7 GB), 20.6 s 4x8192 x2 (3.2 GB, decoded to f32), 16.1 GB resident |
+| steady state, 32 generated tokens | 2.72 tok/s bf16, 2.78 tok/s VQ |
+
+The forward-pass row is the important one: two independent implementations
+(llama.cpp's bf16 kernels and this f32 pass) pick the same next tokens from the
+same weights, so the loader, the rope, the sliding-window mask, the gate and
+the tied head are all right. The VQ rows are then a measurement of the
+quantization, not of a possible bug: both points keep the argmax, and the
+higher-bitrate point is closer on every metric.
+
+What these numbers are not: a perplexity or a full-text KL. They are one
+prompt, one position, and greedy continuation. The 2.7-2.9 tok/s is the f32
+reference streaming 16.45 GB per token; the block GEMV and the tiled prefill in
+section 8 are what a fast runtime would use instead.
+
 ## 9. Pitfalls that cost time here
 
 - Do not trust a hardcoded context. `config.json` says 1,048,576; the repo serves
@@ -410,7 +454,9 @@ throughput claim.
     RECIPE-DOMAIN.md   the ds4 domain-sidecar mechanism and what Spark would need
     tools/vq/          encoder, residuals, planner, builders (CPU and GPU)
     tools/vq/decode.c  C reference decoder: info, check, dump, matvec
-    tools/vq/decode-rs/ Rust decoder and fused GEMV, no crates (bin/dqvq)
+    tools/vq-format/   the one container decoder, linked by dqvq and the runtime
+    tools/dqvq/        CLI over vq-format: info, check, gemv (bin/dqvq)
+    tools/vq-runtime/  CPU f32 reference runtime and logits-diff (sections 8b)
     tools/vq/gpu/decode-gpu.cu  CUDA decode and GEMV kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
