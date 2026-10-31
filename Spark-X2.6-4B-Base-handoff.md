@@ -1,9 +1,9 @@
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
-carries this handoff (docs(agents): how to use the kernel tuner), and
-origin/master is behind it until the push is approved. The working tree is
-clean once that commit exists.
+Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. The active branch is
+feature/dspark-vq (off master at 24eca9e); master itself is 10 commits ahead of
+origin/master and unpushed until that is approved. HEAD on the branch is the
+commit that carries this handoff (docs(handoff): the DSpark draft starts).
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -46,6 +46,12 @@ result. Where a number is missing it says so.
   fingerprint and the device name match. On 4x8192 x2 the profile is
   bit-identical to the heuristic and moves a 500-token prompt from 892.3 to
   917.8 tok/s (section 2).
+- DSpark draft: models/dspark/Spark-X2.6-4B-DSpark.gguf is read by the new
+  bin/dspark dump (tools/dspark), and its architecture is recorded in AGENTS.md
+  section 8d: 5 SWA blocks, 2560 hidden, 16/4 heads x 256, gelu, block size 7,
+  target layers [3, 11, 19, 26, 34], and a Markov head over the block. The
+  draft forward and the propose/verify loop are NOT implemented; that is the
+  active unit on branch feature/dspark-vq.
 
 ## 2. Measurements (do not re-derive)
 
@@ -224,48 +230,48 @@ token by token.
 
 ## 4. Open work, in priority order
 
-1. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
+1. DSpark draft in the VQ runtime. ACTIVE (2026-10-31, branch
+   feature/dspark-vq). Stage 1 is done: the GGUF reader and the architecture
+   dump (tools/dspark, bin/dspark dump), recorded in AGENTS.md section 8d.
+   Stage 2, the draft forward and its gate: turn the GGUF into a flat weight
+   file (BF16 and F32 as stored; no dequant needed for an f32 path), implement
+   the feature encoder (fc_norm per layer, fc, enc.output_norm), the five SWA
+   blocks with attn_gate and gelu, the target's embedding and LM head, then the
+   Markov chain (markov_w2 @ markov_w1[prev] per block position) and the
+   confidence head. Gate: the draft's proposed ids for a fixed committed
+   prefix against the llama.cpp fork (--spec-type draft-dspark), and the
+   acceptance rate on the same prompts the fork was measured on.
+   Stage 3, integration and speed: expose target hidden states at layers 3, 11,
+   19, 26 and 34 from the CUDA runtime's forward_batch, run the draft there
+   (624 M, small next to the 3.4 GB target), verify the drafted block with one
+   target forward_batch, and measure acceptance and tok/s against the 70.8
+   decode rate. Acceptance against a VQ target is the open risk, not the
+   plumbing: the draft was trained on BF16 hidden states and VQ shifts them
+   (manifest relL2 about 2.8-3.4 per tensor).
+2. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
    and gated (section 2), and the tile shapes are now measured per geometry
    (851-918 tok/s at 500-512 tokens against 1743-1909 tok/s for artifact-only
    matrix work), so roughly half the prompt time is the batched attention,
-   four transposes per layer, the norms and 512 embedding row dequeues. Candidate work, in the order the numbers suggest: batch the
-   embedding row dequeue into one launch; fuse the transpose into the norm and
-   gelu kernels; and revisit the B-tile load's 4-way bank conflict (it reads
-   xT column-major and writes shared token-major) plus a 256-token B tile if
-   shared memory allows. Acceptance: raise the 512-token prompt rate without
-   changing the logits beyond the f16 gate in section 2 (argmax and top-25
-   must hold, and the new relL2 is reported).
-2. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
-   DSpark is this model's MTP equivalent and it is already wired on the
-   llama.cpp path (measured 1.13-1.40x there), but it is not wired into the VQ
-   runtime. The prompt path is now fast enough that this is a priority
-   decision rather than a dependency. When it is taken up, the work is: expose
-   target hidden states at five layers, load the draft GGUF, implement the
-   5-block SWA dflash graph with attn_gate and gelu, then the propose/verify
-   loop. Acceptance against a VQ target is unmeasured and must be measured,
-   because the draft was trained on bf16 hidden states and VQ shifts them
-   (manifest relL2 about 2.8-3.4 per tensor).
-
-Why "add MTP" is not an option, checked 2026-10-31: the released checkpoint has
-no MTP layers. model.safetensors.index.json has no mtp or nextn tensors,
-models/hf/config.json has no next-token-prediction field, and
-models/hf/modeling_spark.py has no MTP path. The DSpark draft is the vendor's
-trained multi-token module, shipped separately: its GGUF has no
-token_embd.weight and no output.weight, only output_norm.weight, so it borrows
-the target's embedding and LM head and consumes hidden states at
-dflash.target_layers (the card lists [2, 10, 18, 25, 33]). That is the
-EAGLE-style pattern, a separate 624 M draft fed by target features, not an
-in-checkpoint MTP head. Anything called "fixing MTP" would mean training a
-new module, not repairing one.
-
-3. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
-   also lose both fast kernels, so expect the per-index rates.
-4. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
+   four transposes per layer, the norms and 512 embedding row dequeues.
+   Candidate work, in the order the numbers suggest: batch the embedding row
+   dequeue into one launch; fuse the transpose into the norm and gelu kernels;
+   and revisit the B-tile load's 4-way bank conflict. Acceptance: raise the
+   512-token prompt rate without changing the logits beyond the f16 gate.
+3. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
    first (three words, the shape v3_rounds uses); the tile table would then
    carry it. Per-layer profiles are possible but pointless while matrices
-   share a geometry: the sweep already shows the winner depends on the shape,
-   not the layer. A load-time autotune inside the runtime is the alternative to
-   the profile file, and it would pay the sweep on every cold start.
+   share a geometry. A load-time autotune inside the runtime is the alternative
+   to the profile file, and it would pay the sweep on every cold start.
+4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
+   also lose both fast kernels, so expect the per-index rates.
+
+Why "add MTP" is still not an option, checked 2026-10-31: the released
+checkpoint has no MTP layers. model.safetensors.index.json has no mtp or nextn
+tensors, models/hf/config.json has no next-token-prediction field, and
+models/hf/modeling_spark.py has no MTP path. DSpark is the vendor's separate
+624 M draft: no token_embd, no output weight, borrowing the target's embedding
+and LM head and consuming hidden states at dflash.target_layers. That is the
+EAGLE-style pattern, and it is the only multi-token path available here.
 
 ## 5. Resume
 
@@ -282,6 +288,7 @@ new module, not repairing one.
     ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512 --no-prefill --logits /tmp/gpu-tok.f32
+    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf   # architecture and tensors
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
     ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046 --ctx 64 --profile other.profile   # refused (foreign artifact)
@@ -332,6 +339,13 @@ new module, not repairing one.
   bit-identical: 600 tokens as 512+88 and as one 600-token chunk gave relL2 0,
   so a rate difference between chunk sizes is scheduling, not arithmetic.
   --no-prefill runs the token-by-token path and is the gate's reference.
+- The DSpark card's target_layers and the GGUF disagree: the card says
+  [2, 10, 18, 25, 33], the file says [3, 11, 19, 26, 34]. The file is the
+  authority (it is what the fork's loader reads); treat the card as 1-based or
+  stale, and do not build an extractor from the card.
+- The draft borrows the target's token_embd and LM head and has neither of its
+  own; a draft forward that tries to load weights for them will fail. Its
+  weights are BF16 (tensors) and F32 (norms), 1.249 GB, 58 tensors.
 - A tuning profile is bound to the artifact fingerprint and the device name.
   A profile from another artifact, another GPU, or a changed container is
   refused with a printed reason and the heuristic runs; --no-tune skips the

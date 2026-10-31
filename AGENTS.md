@@ -627,6 +627,63 @@ always uses the default 128x64 tile, so its artifact-only numbers are the
 heuristic's ceiling. Compare the runtime against the bench only with that in
 mind, and use `--no-tune` to reproduce the bench's matrix path in the runtime.
 
+## 8d. The DSpark draft (speculative decoding for the VQ target)
+
+The draft is a separate dflash checkpoint, models/dspark/Spark-X2.6-4B-DSpark.gguf
+(1.25 GB, BF16 weights, F32 norms). It is not MTP inside the checkpoint: it has
+no token_embd and no output weight, and it borrows the target's embedding and
+LM head, which the VQ runtime has. bin/dspark dump prints the file; the reader
+is tools/dspark/src/gguf.rs.
+
+Architecture, read from the GGUF metadata (bin/dspark dump):
+
+    dflash.block_count                5 blocks, all sliding-window
+    dflash.embedding_length           2560
+    dflash.feed_forward_length        10240, gelu (exact erf)
+    dflash.attention.head_count       16 q heads / 4 kv, head_dim 256
+    dflash.rope.dimension_count       64 full, 256 swa; theta 5e6 / 1e4
+    dflash.attention.sliding_window   512, pattern [true x 5]
+    dflash.attention.causal           false (block is attended non-causally)
+    dflash.block_size                 7
+    dflash.sample_from_anchor         true
+    dflash.target_layers              [3, 11, 19, 26, 34]
+
+Tensors: per block attn_norm, attn_q/k/v/out, attn_gate [2560x16], ffn_norm,
+ffn_gate/up/down; plus fc [12800x2560] (five hidden states concatenated),
+fc_norm [2560x5], enc.output_norm, output_norm, markov_w1 [256x131072],
+markov_w2 [256x131072], conf_proj [2816x1]. 58 tensors, 1.249 GB.
+
+The reference implementation is the XHToken llama.cpp fork at 22c0ae1,
+src/models/dflash.cpp. It has two graph modes:
+
+- Embd batch (feature injection): the target's hidden states at the five
+  target_layers for the committed positions are normed per layer with fc_norm,
+  projected by fc, normed by enc.output_norm, and their K/V are written into
+  the draft's cache.
+- Token batch (block diffusion): the block [anchor, MASK x 6] is embedded with
+  the target's token_embd, run through the five SWA blocks with attn_gate
+  (sigmoid per head before out_proj), and turned into logits by the target's
+  LM head.
+
+Then the DSpark Markov head rewrites those logits: for each position i of the
+block, logits(i) += markov_w2 @ markov_w1[prev], where prev starts as the
+anchor token and advances by argmax of the biased logits of position i. The
+optional confidence head is sigmoid(conf_proj . [hidden(i); markov_w1[prev]]).
+With sample_from_anchor true, position 0 is a real draft slot.
+
+Status (2026-10-31, branch feature/dspark-vq): the GGUF reader and the
+architecture dump exist and are committed. The draft forward, the feature
+injection and the propose/verify loop are NOT implemented yet. Acceptance on a
+VQ target is unmeasured and must be measured, because the draft was trained on
+BF16 hidden states and VQ shifts them (manifest relL2 about 2.8-3.4 per
+tensor).
+
+Why it is expected to work with VQ: the draft needs the target's embedding
+rows and LM head, both of which the VQ runtime already computes, and its input
+is target hidden states, which the runtime can expose at layers 3, 11, 19, 26
+and 34. Nothing in the draft requires a weight format the runtime cannot
+produce. The open risk is acceptance, not plumbing.
+
 ## 9. Pitfalls that cost time here
 
 - Do not trust a hardcoded context. `config.json` says 1,048,576; the repo serves
@@ -659,6 +716,7 @@ mind, and use `--no-tune` to reproduce the bench's matrix path in the runtime.
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
     tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
     tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
+    tools/dspark/       DSpark draft GGUF reader and inspection (bin/dspark, section 8d)
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)
