@@ -15,7 +15,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-BIN=${BIN:-/data/llama.cpp-xhtoken/build/bin/llama-server}
+BIN=${BIN:-$ROOT/vendor/llama.cpp-xhtoken/build/bin/llama-server}
+if [ ! -x "$BIN" ] && [ -x /data/llama.cpp-xhtoken/build/bin/llama-server ]; then
+  BIN=/data/llama.cpp-xhtoken/build/bin/llama-server
+  echo "note: using $BIN; run tools/runtime/build-runtime.sh for an in-repo build" >&2
+fi
 MODEL=${MODEL:-$ROOT/models/instruct/Spark-X2.6-4B-Q4_K_M.gguf}
 DRAFT=${DRAFT:-$ROOT/models/dspark/Spark-X2.6-4B-DSpark.gguf}
 ALIAS=${ALIAS:-spark-q4km-dspark}

@@ -30,7 +30,7 @@ BF16.
 `llama-server` must be the one built here, not the stale binaries in
 `~/.local/bin`:
 
-    /data/llama.cpp/build/bin/llama-server
+    ./vendor/llama.cpp/build/bin/llama-server    # built by tools/runtime/build-runtime.sh
 
 open-grok already knows the model as `spark2.6-4b-q6k`
 (`http://127.0.0.1:8090/v1`, context 131072). Start the script first, then pick the
@@ -51,12 +51,13 @@ trained against and the only one that also behaves as an instruct model:
     MODEL="$PWD/models/spark26-4b-Q6_K.gguf" ./models/run-spark26-dspark.sh
     CTX=32768 ./models/run-spark26-dspark.sh
 
-Both targets need the XHToken llama.cpp fork, not `/data/llama.cpp`: the released
+Both targets need the XHToken llama.cpp fork, not upstream: the released
 draft stores a per-head `attn_gate` where the 2026-10-25 upstream `dflash` loader
 expects `attn_q_norm`/`attn_k_norm`, so upstream fails with
 `tensor 'blk.0.attn_q_norm.weight' not found`. Build the fork at
-`/data/llama.cpp-xhtoken` (commit `22c0ae1`, plus an `#include <algorithm>` fix that
-its `llama-context.cpp` is missing under gcc 14).
+`./vendor/llama.cpp-xhtoken` (commit `22c0ae1`, plus an `#include <algorithm>` fix
+that its `llama-context.cpp` is missing under gcc 14). Both trees are fetched and
+built by `tools/runtime/build-runtime.sh`; nothing is read from `/data`.
 
 Measured on this machine, 128K context, q8_0 KV, chat requests at temperature 1.0
 and top_p 0.95, 400 tokens, same fork binary:
@@ -94,6 +95,9 @@ reproduce the loop.
       quant_err.c             llama.cpp k-quant error on one HF matrix
       plan.c                  artifact size and VRAM planner, with --budget
       vendor/                 YoungAi VQ headers, MIT, pinned
+    tools/kquant/     llama.cpp's ggml quantizer, vendored, plus its stubs
+    tools/runtime/    build-runtime.sh: fetches and builds the pinned llama.cpp trees
+    vendor/           the cloned runtime trees (not in git)
     models/           the artifacts, the source checkpoint, logs, checksums, run script
       spark26-4b-Q6_K.gguf    3.46 GB, the artifact
       spark26-4b-bf16.gguf    8.22 GB, the gate reference (not for publishing)
@@ -111,9 +115,9 @@ reproduce the loop.
 ## Pins
 
 - Weights: `XHToken/Spark-X2.6-4B-Base` rev `e1bd659ae2b1c2263b2fc2544485976c1b516115`, Apache-2.0.
-- Toolchain: `/data/llama.cpp` @ `fa3645feb5f47cbb30df5e6d031c22543d43d240`, which
+- Toolchain: `vendor/llama.cpp` @ `fa3645feb5f47cbb30df5e6d031c22543d43d240`, which
   implements `spark2_5` (converter, loader, tokenizer, quantizer).
-- DSpark toolchain: `/data/llama.cpp-xhtoken` @ `22c0ae1871b60123c5afc008a78fe9c6fffa2858`
+- DSpark toolchain: `vendor/llama.cpp-xhtoken` @ `22c0ae1871b60123c5afc008a78fe9c6fffa2858`
   (XHToken fork, CUDA sm_89) plus the `<algorithm>` include fix; required for the draft.
 - Draft: `XHToken/Spark-X2.6-4B-DSpark-GGUF`, `Spark-X2.6-4B-DSpark.gguf`,
   1,254,293,824 B, sha256 `2ee073c18870c66d7fbc8e124fd8d6c2364c8a83e4bbbc3ebaeaa9660eedeac8`.

@@ -1,45 +1,38 @@
 #!/usr/bin/env bash
-# Build the vendored dense-matrix VQ encoder.
+# Build every helper in this repository from sources that live inside it.
 #
-# The encoder is a copy of /data/embeddinggemma2/tools/eg2_vq.c with its two
-# absolute includes rewritten to tools/vq/vendor. The headers are vendored from
-# /data/YoungAi (MIT, commit a4e6d31) and /data/ds4-dfm-rs (ds41_vq_fmt.h, which
-# is itself vendored from the same YoungAi tree). See THIRD_PARTY.md.
-#
-# The reference builds this with plain cc and no CUDA: the GPU Lloyd path assumes
-# unified memory, and this machine reports pageableMemoryAccess = 0.
+# No path outside the repository is used:
+#   - the VQ encoder and its YoungAi headers are in tools/vq
+#   - the k-quant reference encoders are vendored from llama.cpp in tools/kquant
+#   - the four ggml entry points they need are implemented in tools/kquant/stubs.c
+# The runtimes (llama.cpp and the XHToken fork) are separate: tools/runtime/
+# build-runtime.sh fetches the pinned commits into vendor/ and builds them there.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CC=${CC:-cc}
+CFLAGS=${CFLAGS:--O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L}
 
-mkdir -p "$ROOT/bin"
-"$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
-  -I "$ROOT/tools/vq/vendor" \
-  -o "$ROOT/bin/eg2_vq" "$ROOT/tools/vq/eg2_vq.c" -lm
+VQ_INC="-I $ROOT/tools/vq/vendor"
+KQ_INC="-I $ROOT/tools/kquant/vendor/include -I $ROOT/tools/kquant/vendor/src -I $ROOT/tools/kquant/vendor/src/ggml-cpu"
+
+mkdir -p "$ROOT/bin" "$ROOT/.build"
+OBJ="$ROOT/.build"
+
+# The vendored ggml quantizer, compiled once.
+$CC $CFLAGS -c -o "$OBJ/ggml-quants.o" "$ROOT/tools/kquant/vendor/src/ggml-quants.c" $KQ_INC
+echo "built $OBJ/ggml-quants.o"
+
+$CC $CFLAGS $VQ_INC -o "$ROOT/bin/eg2_vq" "$ROOT/tools/vq/eg2_vq.c" -lm
 echo "built $ROOT/bin/eg2_vq"
 
-"$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
-  -I "$ROOT/tools/vq/vendor" \
-  -o "$ROOT/bin/rvq" "$ROOT/tools/vq/rvq.c" -lm
+$CC $CFLAGS $VQ_INC -o "$ROOT/bin/rvq" "$ROOT/tools/vq/rvq.c" -lm
 echo "built $ROOT/bin/rvq"
 
-# Q6_K reference error, using llama.cpp's own quantizer. Needs a built llama.cpp.
-LLAMACPP=${LLAMACPP:-/data/llama.cpp}
-if [ -f "$LLAMACPP/build/bin/libggml-base.so" ]; then
-  "$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
-    -I "$ROOT/tools/vq/vendor" \
-    -I "$LLAMACPP/ggml/include" \
-    -I "$LLAMACPP/ggml/src" \
-    -o "$ROOT/bin/quant_err" "$ROOT/tools/vq/quant_err.c" \
-    -L "$LLAMACPP/build/bin" -lggml-base -lggml -lm \
-    -Wl,-rpath,"$LLAMACPP/build/bin"
-  echo "built $ROOT/bin/quant_err"
-else
-  echo "skipped quant_err: $LLAMACPP/build/bin/libggml-base.so not found"
-fi
-
-"$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
-  -I "$ROOT/tools/vq/vendor" \
-  -o "$ROOT/bin/plan" "$ROOT/tools/vq/plan.c"
+$CC $CFLAGS $VQ_INC -o "$ROOT/bin/plan" "$ROOT/tools/vq/plan.c"
 echo "built $ROOT/bin/plan"
+
+# Needs both the safetensors reader and the k-quant encoders, nothing else.
+$CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
+  "$ROOT/tools/vq/quant_err.c" "$ROOT/tools/kquant/stubs.c" "$OBJ/ggml-quants.o" -lm
+echo "built $ROOT/bin/quant_err"

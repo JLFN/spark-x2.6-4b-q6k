@@ -21,8 +21,18 @@ YoungAi is MIT licensed, Copyright (c) 2026 The ds4.c authors. No file was
 modified in content; only eg2_vq.c's include paths changed, and the two local
 tools (build.sh, quant_err.c) are new.
 
-## tools/vq/quant_err.c
+## tools/vq/quant_err.c and tools/kquant
 
-New in this repository. It links llama.cpp's libggml-base and calls the exported
-reference quantizers (quantize_row_q*_ref, dequantize_row_q*), so the k-quant
-error numbers come from llama.cpp itself rather than a reimplementation.
+quant_err.c is new in this repository. It compares the vendored k-quant
+reference encoders with the VQ rows on the same tensor.
+
+tools/kquant/vendor holds an unmodified copy of the llama.cpp quantizer:
+`src/ggml-quants.c`, `src/ggml-quants.h`, `src/ggml-common.h`, `src/ggml-impl.h`,
+`src/ggml-cpu/ggml-cpu-impl.h`, `include/ggml.h`, `include/ggml-cpu.h`,
+`include/ggml-backend.h`, `include/ggml-alloc.h` and `include/gguf.h`, taken from
+ggml-org/llama.cpp at fa3645feb5f47cbb30df5e6d031c22543d43d240 (MIT). It is
+compiled into `.build/ggml-quants.o`. tools/kquant/stubs.c is new and supplies the
+four ggml entry points that file expects (ggml_abort, ggml_type_size,
+ggml_blck_size, ggml_row_size, ggml_type_name), so no libggml is needed.
+
+llama.cpp is MIT licensed, Copyright (c) 2023-2024 The ggml authors.

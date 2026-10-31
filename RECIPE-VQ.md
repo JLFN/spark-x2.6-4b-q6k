@@ -52,10 +52,13 @@ The encoder used to live in /data/embeddinggemma2 and read headers from
     tools/vq/eg2_vq.c        the encoder (copy, only include paths changed)
     tools/vq/vendor/*.h      YoungAi VQ headers, MIT, pinned to a4e6d31
     tools/vq/vendor/ds41_vq_fmt.h   the on-disk format contract
-    tools/vq/quant_err.c     new: llama.cpp k-quant error on one HF matrix
+    tools/vq/quant_err.c     new: k-quant error on one HF matrix
     tools/vq/rvq.c           new: residual (multi-stage) VQ encoder
     tools/vq/plan.c          new: artifact size and VRAM planner with --budget
     tools/vq/build.sh        builds bin/eg2_vq, rvq, quant_err and plan
+    tools/kquant/vendor/     llama.cpp's ggml-quants.c and its headers, MIT
+    tools/kquant/stubs.c     the four ggml entry points that file needs
+    tools/runtime/build-runtime.sh  clones and builds the pinned llama.cpp trees
     THIRD_PARTY.md           provenance and licenses
 
 Build and verify:

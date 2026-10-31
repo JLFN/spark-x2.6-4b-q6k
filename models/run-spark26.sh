@@ -11,8 +11,15 @@
 # behaviour, not an instruct model's.
 set -euo pipefail
 
-MODEL=${MODEL:-/data/Spark-X2.6-4B-Base/models/spark26-4b-Q6_K.gguf}
-BIN=${BIN:-/data/llama.cpp/build/bin/llama-server}
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+MODEL=${MODEL:-$ROOT/models/spark26-4b-Q6_K.gguf}
+# Built by tools/runtime/build-runtime.sh inside this repository.
+BIN=${BIN:-$ROOT/vendor/llama.cpp/build/bin/llama-server}
+if [ ! -x "$BIN" ] && [ -x /data/llama.cpp/build/bin/llama-server ]; then
+  BIN=/data/llama.cpp/build/bin/llama-server
+  echo "note: using $BIN; run tools/runtime/build-runtime.sh for an in-repo build" >&2
+fi
 CTX=${CTX:-131072}
 PORT=${PORT:-8090}
 KV=${KV:-f16}
