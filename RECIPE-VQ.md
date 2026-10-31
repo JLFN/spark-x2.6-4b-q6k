@@ -122,7 +122,42 @@ The Q4_K row is a plain Q4_K, not the official Q4_K_M mix, so it under-predicts
 that file by about 1 GiB; use the Q4_K_M row's real size (3,543,441,312 B) when
 budgeting that artifact.
 
-## 5. What a runnable VQ Spark still needs
+## 5. KV cost: the runtime's, not the weight encoding's
+
+In ds4 the KV is much smaller than in llama.cpp, and that is worth separating from
+the VQ question because it is a property of the runtime, not of the weights.
+
+Measured and recorded in the ds4 tree:
+
+| Family | KV layout | Cost |
+|---|---|---|
+| DeepSeek-V4.1 | packed FP4: main KV 512 dims = 256 B nibbles + 32 B E4M3 scales = 288 B per group; index K = 64 B nibbles + 4 B E8M0, padded to 72 B (ds41_kvfmt.h:7-11) | one KV head, 512-dim latent |
+| A.X-K2 (VQ) | 770 bytes per token: a 641-byte latent row plus a 129-byte index key (docs/axk2-vq.md) | 11.47 GiB per 262,144-token bank |
+| Beam-VQ | sliding layers keep f16 rings of 512; full layers keep FP8 rows, 2,080 bytes per token and layer (docs/beam-vq.md:48) | 18.28 GiB at 1M |
+
+That compactness comes from those families' latent or compressed KV designs and
+their kernels. It is not produced by the weight VQ: the same packed KV would serve
+a Q6_K build of the same model.
+
+Spark has 4 KV heads of 256 dims, K and V, on 9 full-attention layers, so a
+token costs 2,048 elements per full layer whatever the weights are. Packed like
+ds4's FP4 that is about 1,152 B per token per layer, 10,368 B per token for the
+whole model, about 1.30 GiB at 128K. A 770-B/token latent like A.X-K2 would need
+a trained compressor that Spark does not have.
+
+plan models this directly: --kv-bytes N replaces the computed KV with a measured
+per-token figure.
+
+    ./bin/plan models/hf --vq 4 4096 2 --vq-embed --kv-bytes 770 --ctx 131072
+    # VQ 4x4096 x2   3.10 GB   2,960 weights  +  96 KV  + 1,300 buffers = 4,356 MiB
+
+So in a runtime that packs its KV, the VQ build would sit at 4,356 MiB rather than
+6,737 MiB, and the KV term stops mattering. Two things follow. The weight saving
+from VQ stays at 335 MiB either way, so it does not become more attractive. And
+the KV saving is available to any Spark runtime that implements a packed KV,
+including one serving the existing Q6_K.
+
+## 6. What a runnable VQ Spark still needs
 
 1. Encoder pass over the full model. eg2_vq handles one tensor at a time and reads
    HF safetensors. A driver must walk the 290 tensors, keep 1-D tensors
@@ -153,7 +188,7 @@ budgeting that artifact.
    the paired draft. A Q3_K-class artifact must clear the same bar as the Q6_K
    before it is publishable.
 
-## 6. Decision rule
+## 7. Decision rule
 
 Do not start the runtime work until the encoder shows VQ beating Q4_K per bit on
 at least the FFN matrices, because that is the only outcome that would justify a

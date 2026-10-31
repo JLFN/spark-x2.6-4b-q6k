@@ -108,6 +108,7 @@ int main(int argc, char ** argv) {
             "  --emb q8_0|f16|f32   embedding storage for the k-quant rows (default q8_0)\n"
             "  --ctx N              context tokens (default 131072)\n"
             "  --kv f16|q8_0        KV cache type (default f16)\n"
+            "  --kv-bytes N         override KV with N bytes per token (a packed-KV runtime)\n"
             "  --layers N --full-layers N --kv-heads N --head-dim N\n"
             "  --draft PATH         also load this draft model\n"
             "  --gpu-mib N          card memory (default 12282)\n"
@@ -118,6 +119,7 @@ int main(int argc, char ** argv) {
     const char * dir = argv[1];
     uint64_t ctx = 131072;
     int kv_q8 = 0, layers = 36, full_layers = 9, kv_heads = 4, head_dim = 256;
+    double kv_bytes_per_token = 0.0;   /* >0 overrides the computed KV */
     int want_vq = 0, vq_dim = 4, vq_nc = 4096, vq_stages = 2, vq_embed = 0, json = 0;
     int emb = 0;
     double gpu_mib = 12282.0, budget_mib = 0.0, draft_mib = 0.0;
@@ -129,6 +131,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--full-layers") && i + 1 < argc) full_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--kv-heads") && i + 1 < argc) kv_heads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--head-dim") && i + 1 < argc) head_dim = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-bytes") && i + 1 < argc) kv_bytes_per_token = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gpu-mib") && i + 1 < argc) gpu_mib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget_mib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--emb") && i + 1 < argc) {
@@ -167,10 +170,18 @@ int main(int argc, char ** argv) {
     }
 
     /* KV: full-attention layers hold ctx tokens; the sliding-window layers hold
-     * their 512-token window. One sequence. */
+     * their 512-token window. One sequence. --kv-bytes N overrides this with a
+     * measured per-token figure from a runtime that packs its KV (for example a
+     * ds4 family), because that cost is a property of the runtime, not of the
+     * weight encoding. */
     const double elem = kv_q8 ? 34.0 / 32.0 : 2.0;
-    const double kv_mib = ((double) ctx * (double) full_layers * 2.0 * (double) kv_heads * (double) head_dim * elem
-                         + 512.0 * (double) (layers - full_layers) * 2.0 * (double) kv_heads * (double) head_dim * elem) / MIB;
+    double kv_mib;
+    if (kv_bytes_per_token > 0.0) {
+        kv_mib = (double) ctx * kv_bytes_per_token / MIB;
+    } else {
+        kv_mib = ((double) ctx * (double) full_layers * 2.0 * (double) kv_heads * (double) head_dim * elem
+                + 512.0 * (double) (layers - full_layers) * 2.0 * (double) kv_heads * (double) head_dim * elem) / MIB;
+    }
     /* Compute buffers + CUDA context, measured on this card: 1,079 MiB at 32K and
      * 1,434 MiB at 128K on the Q6_K build. */
     const double buf_mib = 1300.0;
