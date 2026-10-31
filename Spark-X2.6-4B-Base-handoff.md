@@ -1,8 +1,9 @@
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD 1dcaba1, working tree
-clean. Remote https://github.com/JLFN/spark-x2.6-4b-q6k is at f2978e1, so four
-local commits are unpushed (d22cce1, 3c2fef3, d967368, 1dcaba1).
+Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base, HEAD is this handoff commit,
+working tree clean. Remote https://github.com/JLFN/spark-x2.6-4b-q6k is at
+f2978e1, so seven local commits are unpushed: d22cce1, 3c2fef3, d967368,
+1dcaba1, 652198d, d64c289, and this one.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -99,7 +100,7 @@ with 8192):
    CSV columns, compare) is fine.
 3. A VQ runtime. Nothing serves these containers yet; a decode-rate number is
    not a model.
-4. Push: four commits local, origin at f2978e1.
+4. Push: seven commits local, origin at f2978e1.
 
 ## 5. Resume
 
