@@ -90,7 +90,7 @@ struct Stage<'a> {
     rows: usize,
     cols: usize,
     nbit: u32,
-    /// DQV3 row-local stream: bytes of the 12-bit main stream and of the plane,
+    /// DQV3 row-local stream: bytes of the min(bit width, 12)-bit main stream and of the plane,
     /// per row. Zero for DQVQ, whose bits run across the whole matrix.
     v3: bool,
     mrow: usize,
@@ -172,17 +172,20 @@ impl<'a> Stage<'a> {
     #[inline]
     fn index(&self, row: usize, i: usize) -> u32 {
         if self.v3 {
-            let nidx_row = self.cols / self.dim;
-            let bit = i * 12;
+            /* The main stream is min(bit width, 12) bits per index, not always
+             * 12: build-vq-gpu.c packs mb = bits > 12 ? 12 : bits, so a 1024
+             * codebook has 10-bit slots and shorter rows. A fixed 12 here read
+             * the wrong weights for every nc below 4096. */
+            let mb = (self.nbit as usize).min(12);
+            let bit = i * mb;
             let q = row * self.mrow + (bit >> 3);
             let byte = |k: usize| self.stream.get(q + k).copied().unwrap_or(0) as u32;
             let w = byte(0) | byte(1) << 8 | byte(2) << 16 | byte(3) << 24;
-            let mut v = (w >> (bit & 7)) & 0xfff;
+            let mut v = (w >> (bit & 7)) & ((1u32 << mb) - 1);
             if self.prow > 0 {
                 let p = self.mrow * self.rows + row * self.prow + (i >> 3);
                 v |= (u32::from(self.stream.get(p).copied().unwrap_or(0)) >> (i & 7) & 1) << 12;
             }
-            let _ = nidx_row;
             return v;
         }
         let gi = row * (self.cols / self.dim) + i;

@@ -134,11 +134,14 @@ static int expected_payload(const hdr_t * h, size_t * out) {
     return 0;
 }
 
-static uint32_t rd_main12(const uint8_t * base, size_t i) {
-    const size_t bit = i * 12;
+/* One index of the v3 main stream, which is min(bit width, 12) bits wide
+ * (build-vq-gpu.c:59 packs mb = bits > 12 ? 12 : bits). A fixed 12 here
+ * decoded every payload below nc 4096 at the wrong bit offsets. */
+static uint32_t rd_main(const uint8_t * base, size_t i, int mb) {
+    const size_t bit = i * (size_t) mb;
     const uint8_t * q = base + (bit >> 3);
     const uint32_t w = (uint32_t) q[0] | ((uint32_t) q[1] << 8) | ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24);
-    return (w >> (bit & 7)) & 0xFFFu;
+    return (w >> (bit & 7)) & ((1u << mb) - 1u);
 }
 
 /* Decode one stage payload, DQVQ (v2) or DQV3 (row-local 12-bit + plane). */
@@ -182,7 +185,7 @@ static int decode_stage(const uint8_t * p, float * out, uint32_t * rows_o, uint3
         const uint8_t * plane = q + (size_t) rows * mrow;
         for (uint32_t r = 0; r < rows; r++) {
             for (size_t i = 0; i < nidx_row; i++) {
-                uint32_t v = rd_main12(main + (size_t) r * mrow, i) & ((1u << mb) - 1u);
+                uint32_t v = rd_main(main + (size_t) r * mrow, i, mb);
                 if (prow) v |= (uint32_t) ((plane[(size_t) r * prow + (i >> 3)] >> (i & 7)) & 1u) << 12;
                 if (v >= nc) { free(C); free(gr); return -1; }
                 const float g = gr[r];
@@ -289,10 +292,12 @@ static int cmd_info(const char * path) {
 
     printf("file        %s\n", path);
     printf("bytes       %zu (%.4f GB)\n", n, (double) n / 1e9);
-    printf("format      %s (%s)\n", v3 ? "DQV3" : "DQVQ", v3 ? "row-local 12-bit + plane" : "global bitstream");
+    printf("format      %s (%s)\n", v3 ? "DQV3" : "DQVQ",
+           v3 ? (bits > 12 ? "row-local 12-bit + 1-bit plane" : "row-local main stream only")
+              : "global bitstream");
     printf("shape       %u x %u, %zu weights\n", h.rows, h.cols, (size_t) h.rows * h.cols);
-    printf("per stage   dim %u, nc %u (%d-bit index), %zu bytes\n",
-           h.dim, h.nc, bits, per);
+    printf("per stage   dim %u, nc %u (%d-bit index, %d-bit stream), %zu bytes\n",
+           h.dim, h.nc, bits, v3 ? mb : bits, per);
     printf("stages      %u, payload %llu, total %zu\n",
            h.stages, (unsigned long long) h.payload, 32 + want);
     printf("bits/weight %.4f\n", n * 8.0 / ((double) h.rows * h.cols));
