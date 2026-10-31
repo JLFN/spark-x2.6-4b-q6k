@@ -56,7 +56,8 @@ cp "$ROOT/tools/target/release/vq-bench" "$ROOT/bin/vq-bench"
 cp "$ROOT/tools/target/release/vq-runtime" "$ROOT/bin/vq-runtime"
 cp "$ROOT/tools/target/release/logits-diff" "$ROOT/bin/logits-diff"
 cp "$ROOT/tools/target/release/vq-tune" "$ROOT/bin/vq-tune"
-echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime, $ROOT/bin/logits-diff and $ROOT/bin/vq-tune"
+cp "$ROOT/tools/target/release/dspark" "$ROOT/bin/dspark"
+echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime, $ROOT/bin/logits-diff, $ROOT/bin/vq-tune and $ROOT/bin/dspark"
 
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \

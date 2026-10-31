@@ -1,0 +1,10 @@
+[package]
+name = "dspark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "DSpark draft model: GGUF reader and the dflash forward pass"
+
+[[bin]]
+name = "dspark"
+path = "src/main.rs"
