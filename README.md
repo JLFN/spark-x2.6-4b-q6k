@@ -85,11 +85,14 @@ reproduce the loop.
 
     RECIPE.md         the recipe and the record: pins, type choice, commands, gate, release plan
     RECIPE-VQ.md      the dense-VQ investigation, its measurements, and what a VQ run would need
+    RECIPE-DOMAIN.md  the ds4 domain-sidecar mechanism, what maps to Spark, and the build order
     THIRD_PARTY.md    provenance and licenses for the vendored VQ encoder
     tools/vq/         the dense-VQ encoder, vendored and buildable here
-      build.sh                builds bin/eg2_vq and bin/quant_err
+      build.sh                builds bin/eg2_vq, rvq, quant_err and plan
       eg2_vq.c                the encoder (copy of the EmbeddingGemma tool)
+      rvq.c                   residual VQ: stacks stages to reach higher rates
       quant_err.c             llama.cpp k-quant error on one HF matrix
+      plan.c                  artifact size and VRAM planner, with --budget
       vendor/                 YoungAi VQ headers, MIT, pinned
     models/           the artifacts, the source checkpoint, logs, checksums, run script
       spark26-4b-Q6_K.gguf    3.46 GB, the artifact

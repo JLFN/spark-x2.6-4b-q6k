@@ -19,6 +19,11 @@ mkdir -p "$ROOT/bin"
   -o "$ROOT/bin/eg2_vq" "$ROOT/tools/vq/eg2_vq.c" -lm
 echo "built $ROOT/bin/eg2_vq"
 
+"$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
+  -I "$ROOT/tools/vq/vendor" \
+  -o "$ROOT/bin/rvq" "$ROOT/tools/vq/rvq.c" -lm
+echo "built $ROOT/bin/rvq"
+
 # Q6_K reference error, using llama.cpp's own quantizer. Needs a built llama.cpp.
 LLAMACPP=${LLAMACPP:-/data/llama.cpp}
 if [ -f "$LLAMACPP/build/bin/libggml-base.so" ]; then
@@ -33,3 +38,8 @@ if [ -f "$LLAMACPP/build/bin/libggml-base.so" ]; then
 else
   echo "skipped quant_err: $LLAMACPP/build/bin/libggml-base.so not found"
 fi
+
+"$CC" -O3 -std=c99 -Wall -D_POSIX_C_SOURCE=200809L \
+  -I "$ROOT/tools/vq/vendor" \
+  -o "$ROOT/bin/plan" "$ROOT/tools/vq/plan.c"
+echo "built $ROOT/bin/plan"
