@@ -254,29 +254,61 @@ mismatches, 3,375,234,666 bytes.
 Three decoders read the same container, and the GPU one answers the speed
 question in one command:
 
-    ./bin/decode-gpu --manifest models/vq-build-8192-2 --iters 5
+    ./bin/decode-gpu --manifest models/vq-build-8192-2-v3 --iters 10
 
 It sums the fused gather+dot over every matrix in the manifest and prints the
 container rate and the modeled tokens per second for matrix work at batch 1.
-Measured on the RTX 4070 SUPER, best of five:
+The Rust harness prints the same numbers and names the kernel it chose:
+
+    ./bin/vq-bench models/vq-build-8192-2-v3 --iters 10
+
+Measured on the RTX 4070 SUPER, every artifact in the DQV3 row-local payload,
+one run on 2026-10-31:
 
 | Artifact | container | bpw | fused ms/token | GB/s | tok/s |
 |---|---:|---:|---:|---:|---:|
-| 4x1024 x1 | 1.289 GB | 2.51 | 5.064 | 254.6 | 197.5 |
-| 4x8192 x2 | 3.375 GB | 6.57 | 10.266 | 328.7 | 97.4 |
-| 4x4096 x3 | 4.655 GB | 9.06 | 16.196 | 287.4 | 61.7 |
+| 4x1024 x1 | 1.289 GB | 2.51 | 4.080 | 316.0 | 245.1 |
+| 4x8192 x2 | 3.375 GB | 6.57 | 10.844 | 311.2 | 92.2 |
+| 4x4096 x3 | 4.655 GB | 9.06 | 13.322 | 349.4 | 75.1 |
 
-Decode time tracks container bytes almost exactly, so quality is bought with
-decode time in direct proportion. The kernel matters: the first warp-per-row
-version ran at 107 GB/s and 36.7 tok/s, and the current one reaches 329 GB/s by
-loading one 8-byte `uint2` codebook entry per index, converting with
-`__half22float2`, and unrolling four indices deep. A plain f32 GEMV on the same
-card reaches 470 GB/s, so the gather still costs about 30 percent of bandwidth.
+Repeats of the 4x8192 x2 point in the same session landed between 10.18 and
+10.84 ms (98 to 92 tok/s). The older DQVQ build of the same 4x8192 x2 weights
+measured 14.629 ms (230.7 GB/s, 68.4 tok/s) in that run, and 13.25-14.57 ms in
+the run before it. Two cautions follow from that:
+
+- Compare kernels and artifacts only inside one run. The card's throughput
+  moved by up to 30 percent between sessions on the same binary and artifact
+  (a 2026-10-30 run put the DQVQ build at 10.27 ms), so an absolute number
+  from another day is not a baseline.
+- The kernel, not the payload, is where the 20-25 percent lives. On one matrix
+  in one run: DQV3 block kernel 0.0717 ms, per-index dim-4 kernel 0.0881 ms.
+
+The four fused variants, all in the same binary (`vqg_gemv_ready` says which a
+geometry can run, and the report's `kernels` line names the one used):
+
+- variant 3, DQV3 block decode. The row's 12-bit stream is read as 96-word
+  blocks (three 128-byte lines): lane j holds words j, j+32, j+64, and a
+  round's index word arrives by one shuffle plus a funnel shift; the 13th bit
+  comes from that block's plane word by one more shuffle. This is the only
+  kernel that uses the v3 payload's structure (ds4-dfm-rs
+  `cuda/ds41_vq_row.cuh:122-137`, `:200-220`). It needs `nidx_row % 32 == 0`
+  and a 4-byte-aligned row stream.
+- variant 2, dim-4 fast path: one index at a time, one 8-byte `uint2` codebook
+  entry, `__half22float2`, four indices deep. The DQVQ payload can only use
+  this one, because its indices are not row-local.
+- variant 1, generic warp: any dim, one index at a time, about 100 GB/s. This
+  is what a non-dim-4 artifact falls back to.
+- variant 0, shared codebook: only when `nc*dim*2` fits the device's opt-in
+  shared window (dim 8 with 8192 codewords is 131,072 bytes and does not).
+
+A plain f32 GEMV on the same card reaches 470 GB/s, so the best VQ rate is
+about 70 percent of what this card demonstrably streams: the index gather and
+the plane shuffles are issue- and latency-bound before DRAM is saturated.
 
 Two paths that are deliberately slower, both in the same binary:
 
 - dequant to f32 (`dequant` line): 136 ms for the whole artifact at 24.8 GB/s.
-  This is the expand-once loader shape, and it is 13x slower than fusing.
+  This is the expand-once loader shape, and it is about 13x slower than fusing.
 - shared-memory codebook (variant 0): 38 GB/s; staging 64 KB per block costs
   more than the L1 misses it saves.
 
@@ -289,8 +321,15 @@ Container checks, independent of the encoder's own bookkeeping:
     ./bin/decode-gpu    <file.bin> --check              # CUDA must match a host f64 matvec
 
 The C and Rust decoders are bit-exact against each other (26,214,400 of
-26,214,400 values on layer 0). The CUDA gate matches the host f64 matvec at
-maxabs 3e-6.
+26,214,400 values on layer 0), checked on all three v3 shapes built here:
+dim 4 with 4096 and 8192 codewords, and dim 8 with 8192. The CUDA gate matches
+the host f64 matvec at maxabs 2e-6 on the same shapes.
+
+The 13-bit width is enforced, not just documented: DQV3 carries 12 bits in the
+row's main stream plus one in the plane, so nc above 8192 cannot be encoded.
+`build-vq-gpu` refuses such an encoding and all three decoders refuse such a
+container, instead of decoding the low 13 bits of a 14-bit index and returning
+wrong weights.
 
 What these numbers are not: the matrix cost of one token with no attention, no
 KV read and no sampling. They are the decode rate of the VQ path, not a server
