@@ -75,8 +75,13 @@ result. Where a number is missing it says so.
   propose/verify loop. On the 64-token greedy gate the generated ids are
   identical to the instrumented reference fork (BF16 target) and identical to
   the VQ target's own greedy continuation (VQ 4x8192 x2 target), with
-  acceptance 40.476% and 68.831% respectively (section 2). Phase C, the GPU
-  draft executor, is not started.
+  acceptance 40.476% and 68.831% respectively (section 2). Phases C and D are
+  done: vq-model-gpu captures the target layer inputs, runs the draft on the
+  same device through cuBLAS, verifies a batch and rolls the committed prefix
+  forward. Gate 1 passes bitwise, the GPU ids are identical to the CPU VQ
+  spec ids, and the bench measures 89.25 tok/s against a 70.81 tok/s greedy
+  baseline (1.29x) with a 50.3% break-even acceptance against the measured
+  68.831%.
 
 ## 2. Measurements (do not re-derive)
 
@@ -240,9 +245,10 @@ for per-token acceptance a with k = 6 is (1 - a^7)/(1 - a):
     a 0.50 -> 1.98 accepted -> 27.9 ms -> 1.40x
     a 0.70 -> 3.20 accepted -> 45.1 ms -> 2.25x
 
-Break-even sits near 0.3, and this draft measured 0.20-0.32 on the Q6_K and
-Q4_K_M targets. A quantized draft would cut the 1.25 GB read and push
-break-even down. None of this is a result until phase D runs.
+Break-even sits near 0.3 in this estimate, and this draft measured 0.20-0.32
+on the Q6_K and Q4_K_M targets. The estimate is superseded by the phase C/D
+measurement below: the draft costs 13.9 ms per round, the verify 49.6 ms,
+and the measured break-even is 50.3% per drafted token, not 30%.
 
 Draft phase B gate, MEASURED 2026-10-31 on the CPU chain (tools/dspark spec),
 prompt [1046, 11862, 314, 17349, 390], greedy, block size 7:
@@ -262,13 +268,38 @@ prompt [1046, 11862, 314, 17349, 390], greedy, block size 7:
         (vq-runtime --weights vq --gen 64)
         11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
         decode 38.3 s after a 20 s weight load, 1.67 committed tok/s
-        the VQ continuation differs from the BF16 one (it loops on
-        "Paris is a capital of France"); the chain is exact for its target,
-        the target is the quantized one
+        the VQ continuation differs from the BF16 one: after the first
+        tokens it settles into the cycle 19500, 390, 275, 11862, 314,
+        17349, 27; the chain is exact for its target, the target is the
+        quantized one
 
 The first-block gate also matches on both captures: proposals
 [220 30 35 29 27 198 198], exactly the reference's logged ids. Per-row logits
 differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
+
+Draft phase C/D gate, MEASURED 2026-11-01 on the GPU chain (vq-model-gpu,
+tools/vq/gpu/dspark-gpu.cuh), same prompt and target:
+
+    GPU spec, 64 generated ids
+        ids byte-identical to the CPU VQ spec ids above
+        11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
+        decode 0.72 s after the target load, 89.25 tok/s committed
+        round 63.8 ms (draft 13.9 ms, verify 49.6 ms)
+    gate 1, four blocks with different anchors in two orders
+        28 rows x 131072 logits, maxabs 0, no argmax or proposal mismatch
+    baseline, same process and device
+        70.81 tok/s greedy (14.1 ms/token)
+        speedup 1.29x at the measured acceptance
+        break-even acceptance 50.3% per drafted token (measured 68.831%)
+    trap: verify_logits must use the same per-row GEMV as tail_logits for
+        the tied head. Routing the 8-row verify logits through prefill_mat
+        changed the first token from 19500 to 220; the per-row GEMV matches
+        the prompt path exactly.
+
+The GPU draft weights are loaded as f32 from the manifest and multiplied
+with cuBLAS; the target keeps its VQ kernels. The draft K/V cache holds the
+injected target features for committed positions and the block's own K/V
+stay in the per-round row buffer.
 
 ## 3. Decisions and why
 
@@ -420,9 +451,9 @@ differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
    rollback truncates both caches. The manifest's mask_token (2, from
    tokenizer.ggml.mask_token_id) fills the noise slots.
 
-   Gate 1 (permutation invariance across a batch of blocks) is deferred: the
-   CPU decoder runs one block, so there is no batch composition to permute.
-   It moves to the batched GPU executor in phase C.
+   Gate 1 (permutation invariance across a batch of blocks) is met on the GPU
+   executor: four blocks with different anchors, run in two batch orders,
+   produce bit-identical logits (maxabs 0) and identical proposals.
 
    Gate 2 (reference fork, 64-token greedy) is met, measured in section 2:
    identical generated ids and identical acceptance on the BF16 target, and
@@ -431,7 +462,7 @@ differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
    targets measured, and 68.831% on VQ 4x8192 x2, well above the ~0.3
    break-even the economics estimate names.
 
-   Phase C, GPU executor and integration (CUDA).
+   Phase C, GPU executor and integration (CUDA). DONE 2026-11-01.
 
    - Draft kernels: the draft shares the target's head geometry (16 heads of
      256, 4 KV heads), so the existing norm, rope, attention and GEMV shapes
@@ -448,20 +479,23 @@ differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
    - Propose/verify: propose up to block_size tokens, verify with one target
      forward_batch, accept the longest common prefix, repeat. Greedy only until
      the acceptance number exists.
-   - Acceptance for phase C: ids identical to the CPU draft path at
-     temperature 0, and an end-to-end rate reported together with acceptance
-     against the 70.8 tok/s baseline.
+   - Acceptance for phase C: met. The GPU ids are byte-identical to the CPU
+     VQ spec ids at temperature 0; the end-to-end rate is 89.25 tok/s against
+     the 70.81 tok/s greedy baseline, with acceptance 68.831%.
 
-   Phase D, measurement and the decision.
+   Phase D, measurement and the decision. DONE 2026-11-01.
 
-       dspark bench --target DIR --draft DIR --tokens N --gen M
+       ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+           --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+           --draft out/draft --bench
 
-   reports acceptance, accepted tokens per round, draft ms, verify ms, tok/s,
-   and the break-even acceptance for the measured round cost. The number that
-   decides whether the feature ships is acceptance on the VQ target. The
-   estimate in section 2 puts break-even near 0.3; the same draft measures
-   0.20-0.32 on the Q6_K and Q4_K_M targets, so a modest gain or none at all is
-   the honest forecast until this runs.
+   The bench runs the spec path and the plain greedy baseline in one process
+   and reports acceptance, accepted and committed tokens per round, draft ms,
+   verify ms, tok/s and the break-even acceptance for the measured round
+   cost. The measured break-even is 50.3% per drafted token; the measured
+   acceptance is 68.831%, so the feature is a 1.29x win on this target. The
+   earlier ~0.3 estimate was optimistic because the draft block costs
+   13.9 ms, not the 4-6 ms assumed in section 2.
 
 2. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
    and gated (section 2), and the tile shapes are now measured per geometry
@@ -511,7 +545,9 @@ EAGLE-style pattern, and it is the only multi-token path available here.
     ./bin/dspark forward --draft out/draft --hidden /tmp/hid.bin --target models/hf --anchor 390 --pos0 4
     ./bin/dspark spec --draft out/draft --target models/hf --ids 1046,11862,314,17349,390 --gen 64 --rounds
     ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 --weights vq --ids 1046,11862,314,17349,390 --gen 64
-    ./bin/dspark bench --target models/vq-build-8192-2-v3 --draft out/draft --gen 64   # planned (phase D)
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 --draft out/draft --out /tmp/gpu-ids.txt
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --ctx 4096 --draft out/draft --gate1
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 --draft out/draft --bench
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
     ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046 --ctx 64 --profile other.profile   # refused (foreign artifact)

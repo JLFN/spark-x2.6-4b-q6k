@@ -716,13 +716,21 @@ tokenizer.ggml.mask_token_id and checked against vocab, because the block's
 noise slots need it and the draft ships no vocabulary; and the conf_bias role,
 because conf_proj ships a bias in the reference.
 
-Status (2026-10-31, branch feature/dspark-vq): the reader, the dump, the
-converter, the checker, the CPU draft forward and the full CPU propose/verify
-loop are implemented. The target is driven in-process through the new
-vq-runtime library, so the draft reads the target's tied embedding in place
-and never loads a second copy of it. The target's layer-input hidden rows are
-captured at layers 3, 11, 19, 26 and 34, and a rollback truncates both the KV
-cache and those captures to the committed length after a partial acceptance.
+Status (2026-11-01, branch feature/dspark-vq): phases A, B, C and D are
+implemented. The reader, the dump, the converter, the checker, the CPU draft
+forward and the CPU propose/verify loop are phase A/B. Phase C is the GPU
+executor: vq-model-gpu captures the target layer-input rows at layers 3, 11,
+19, 26 and 34 into a position-major device buffer, verify_logits returns the
+tied-head logits for every row of a verification batch, and dspark-gpu.cuh
+runs the feature encoder, the block decoder (S independent blocks), the
+Markov chain and the confidence head on the same device. The draft weights
+are loaded as f32 from the manifest and multiplied with cuBLAS, so the GPU
+follows the CPU gate; the target keeps its VQ kernels. The draft's K/V cache
+holds the injected target features for committed positions, the block's own
+K/V stay in the per-round row buffer, and no host round-trip is needed
+between the target verify and the next draft block. Phase D is `--bench`,
+which runs the spec path and the plain greedy baseline in one process and
+prints the break-even acceptance.
 
 Run one block from a capture (the first-block gate):
 
@@ -737,6 +745,19 @@ Run the full propose/verify loop (the 64-token gate):
         --ids 1046,11862,314,17349,390 --gen 64 --rounds --out /tmp/ids.txt
     ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 \
         --weights vq --ids 1046,11862,314,17349,390 --gen 64
+
+The GPU path runs the same loop inside vq-model-gpu, with the target and the
+draft on one device and no host round-trip between a verify and the next
+draft block:
+
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+        --draft out/draft --out /tmp/gpu-ids.txt
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --ctx 4096 --draft out/draft --gate1
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+        --draft out/draft --bench
 
 The prompt ids are "The capital of France is" from llama.cpp /tokenize with
 add_special false; the reference holds the last prompt token (390) back as the
@@ -760,18 +781,30 @@ Measured gates, 2026-10-31:
 - 64-token greedy, VQ 4x8192 x2 target: the speculative ids are identical to
   that VQ target's own greedy continuation (vq-runtime --weights vq --gen 64),
   11 rounds, 77 drafted, 53 accepted (68.831%). The VQ continuation is not the
-  BF16 one (it loops on "Paris is a capital of France"), which is the
-  quantization's effect on the target, not a chain error: the chain is exact
-  for the target it runs.
+  BF16 one: after the first tokens the 64-token run settles into the cycle
+  19500, 390, 275, 11862, 314, 17349, 27. That is the quantization's effect
+  on the target, not a chain error: the chain is exact for the target it
+  runs.
 - CPU speed is reference speed, not a product number: the 64-token BF16 chain
   takes 61.4 s of decode after a 26 s weight load, about 1.1 committed
-  tok/s; the VQ chain takes 38.3 s of decode after a 20 s load. The GPU draft
-  executor is phase C and is not built.
+  tok/s; the VQ chain takes 38.3 s of decode after a 20 s load.
+- GPU phase C, 2026-11-01, VQ 4x8192 x2 target: the GPU spec ids are
+  byte-identical to the CPU spec ids (11 rounds, 77 drafted, 53 accepted,
+  68.831%). The verify tail uses per-row GEMV for the tied head; routing
+  those logits through prefill_mat changed the first token (220 against the
+  correct 19500), so verify_logits stays on the same GEMV as tail_logits.
+- Gate 1, batch permutation invariance: four blocks with different anchors
+  run in one batch and then in a permuted batch; maxabs 0 over 28 rows of
+  131072 logits, no argmax or proposal mismatch.
+- Phase D bench, same prompt and device: spec 89.25 tok/s against a 70.81
+  tok/s greedy baseline (1.29x), round 63.8 ms (draft 13.9 ms, verify 49.6
+  ms), break-even acceptance 50.3% per drafted token against the measured
+  68.8%. The handoff's earlier ~0.3 estimate was optimistic: the measured
+  draft cost puts break-even at 50.3%, and 68.8% still clears it.
 
-Gate 1 in the handoff (permutation invariance across a batch of several
-blocks) still needs a batched executor: this decoder runs one block, so there
-is no batch composition to permute yet. It moves to the GPU batch work with
-the rest of phase C.
+Gate 1 is met. The GPU block decoder runs four independent blocks in one
+batch, then the same blocks in a permuted order; the logits are bit-identical
+(maxabs 0) and every argmax and proposal matches.
 
 ## 9. Pitfalls that cost time here
 
@@ -803,6 +836,7 @@ the rest of phase C.
     tools/vq/gpu/decode-gpu.cu  CUDA decode, GEMV, tiled prefill kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
+    tools/vq/gpu/dspark-gpu.cuh  GPU draft executor, gates and bench (phases C/D)
     tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
     tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
     tools/dspark/       DSpark draft reader, converter and checker (bin/dspark, section 8d)

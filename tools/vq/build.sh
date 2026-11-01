@@ -92,8 +92,11 @@ if [ -x "$NVCC" ]; then
 
   # Whole-model GPU runtime: the same object's fused GEMV, plus the model's
   # norms, rope, attention, gate and MLP kernels.
+  # cuBLAS is the draft's f32 GEMM path: the draft weights are BF16 in the
+  # manifest and are loaded as f32 so the GPU follows the CPU gate. The target
+  # itself stays on the repository's own VQ kernels.
   $NVCC -O3 -std=c++17 -arch=sm_$ARCH -o "$ROOT/bin/vq-model-gpu" \
-    "$ROOT/tools/vq/gpu/vq-model-gpu.cu" "$OBJ/decode_gpu.o" -lm
+    "$ROOT/tools/vq/gpu/vq-model-gpu.cu" "$OBJ/decode_gpu.o" -lm -lcublas
   echo "built $ROOT/bin/vq-model-gpu"
 else
   echo "skipped build-vq-gpu and decode-gpu: $NVCC not found"
