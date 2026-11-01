@@ -95,8 +95,10 @@ impl Store {
         let index = dir.join("model.safetensors.index.json");
         let mut map = HashMap::new();
         if index.exists() {
-            let text = std::fs::read_to_string(&index).map_err(|e| format!("{}: {e}", index.display()))?;
-            let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", index.display()))?;
+            let text =
+                std::fs::read_to_string(&index).map_err(|e| format!("{}: {e}", index.display()))?;
+            let v: Value =
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", index.display()))?;
             let wm = v
                 .get("weight_map")
                 .and_then(Value::as_object)
@@ -104,7 +106,9 @@ impl Store {
             for (name, f) in wm {
                 map.insert(
                     name.clone(),
-                    f.as_str().ok_or("weight_map value is not a path")?.to_string(),
+                    f.as_str()
+                        .ok_or("weight_map value is not a path")?
+                        .to_string(),
                 );
             }
         } else {
@@ -112,7 +116,10 @@ impl Store {
              * the header decides whether the name exists. */
             let single = dir.join("model.safetensors");
             if !single.exists() {
-                return Err(format!("{}: no model.safetensors(.index.json)", dir.display()));
+                return Err(format!(
+                    "{}: no model.safetensors(.index.json)",
+                    dir.display()
+                ));
             }
             map.insert(String::new(), "model.safetensors".into());
         }

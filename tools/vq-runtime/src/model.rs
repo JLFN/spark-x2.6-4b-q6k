@@ -136,17 +136,42 @@ impl Weights {
                 return Err(format!("layer {i}: a norm is not {} wide", cfg.hidden));
             }
             let qkv = l.tensor(&p("self_attn.q_k_v_proj.weight"))?;
-            expect(&qkv, &p("self_attn.q_k_v_proj.weight"), cfg.q_dim() + 2 * cfg.kv_dim(), cfg.hidden)?;
+            expect(
+                &qkv,
+                &p("self_attn.q_k_v_proj.weight"),
+                cfg.q_dim() + 2 * cfg.kv_dim(),
+                cfg.hidden,
+            )?;
             let attn_gate = l.tensor(&p("self_attn.g_proj.weight"))?;
-            expect(&attn_gate, &p("self_attn.g_proj.weight"), cfg.heads, cfg.hidden)?;
+            expect(
+                &attn_gate,
+                &p("self_attn.g_proj.weight"),
+                cfg.heads,
+                cfg.hidden,
+            )?;
             let out = l.tensor(&p("self_attn.out_proj.weight"))?;
-            expect(&out, &p("self_attn.out_proj.weight"), cfg.hidden, cfg.q_dim())?;
+            expect(
+                &out,
+                &p("self_attn.out_proj.weight"),
+                cfg.hidden,
+                cfg.q_dim(),
+            )?;
             let gate = l.tensor(&p("mlp.gate_proj.weight"))?;
-            expect(&gate, &p("mlp.gate_proj.weight"), cfg.intermediate, cfg.hidden)?;
+            expect(
+                &gate,
+                &p("mlp.gate_proj.weight"),
+                cfg.intermediate,
+                cfg.hidden,
+            )?;
             let up = l.tensor(&p("mlp.up_proj.weight"))?;
             expect(&up, &p("mlp.up_proj.weight"), cfg.intermediate, cfg.hidden)?;
             let down = l.tensor(&p("mlp.down_proj.weight"))?;
-            expect(&down, &p("mlp.down_proj.weight"), cfg.hidden, cfg.intermediate)?;
+            expect(
+                &down,
+                &p("mlp.down_proj.weight"),
+                cfg.hidden,
+                cfg.intermediate,
+            )?;
             layers.push(LayerW {
                 in_norm,
                 post_norm,
@@ -244,6 +269,13 @@ pub struct Model {
     logits: Vec<f32>,
     cos: Vec<f32>,
     sin: Vec<f32>,
+    /// Hidden rows at the residual input of each requested layer, captured
+    /// while the forward pass runs. One slot per requested layer; a row is
+    /// appended at every position it visits. Layer-input capture is what the
+    /// draft feature encoder reads (llama-graph.cpp:1451, res->t_layer_inp[il]
+    /// = inpL at the start of a layer in the reference trunk graphs).
+    capture_slots: Vec<Option<usize>>,
+    captures: Vec<Vec<f32>>,
 }
 
 struct Scratch {
@@ -281,8 +313,72 @@ impl Model {
             logits: vec![0f32; c.vocab],
             cos: vec![0f32; c.head_dim],
             sin: vec![0f32; c.head_dim],
+            capture_slots: vec![None; c.layers],
+            captures: Vec::new(),
             w,
         }
+    }
+
+    /// Enable layer-input capture for the given 0-based layer ids. The capture
+    /// destination is ordered by the request, and every forward position then
+    /// appends its hidden row to that slot.
+    pub fn enable_capture(&mut self, ids: &[u32], hidden: usize) -> Result<(), String> {
+        for (k, &lid) in ids.iter().enumerate() {
+            let li = lid as usize;
+            if li >= self.w.cfg.layers {
+                return Err(format!(
+                    "capture layer {lid} is outside the {} layers",
+                    self.w.cfg.layers
+                ));
+            }
+            if self.capture_slots[li].is_some() {
+                return Err(format!("capture layer {lid} is listed twice"));
+            }
+            self.capture_slots[li] = Some(k);
+        }
+        self.captures = (0..ids.len())
+            .map(|_| Vec::with_capacity(self.max_ctx * hidden))
+            .collect();
+        Ok(())
+    }
+
+    /// The captured hidden rows for slot k, position-major.
+    pub fn captured(&self, k: usize) -> &[f32] {
+        &self.captures[k]
+    }
+
+    /// The target embedding row for `id`, the tied input/output matrix row the
+    /// draft block reads for its anchor and mask tokens.
+    pub fn embed_row(&self, id: u32) -> &[f32] {
+        self.w.embed.row(id as usize)
+    }
+
+    /// Truncate the KV cache and the layer-input captures to the first `pos`
+    /// positions. Speculative verification processes a whole draft block and
+    /// then keeps only the rows the target accepted, so the rejected rows have
+    /// to leave the cache before the next round
+    /// (examples/speculative-simple/speculative-simple.cpp:330: seq_rm(n_past)).
+    pub fn rollback(&mut self, pos: usize) -> Result<(), String> {
+        if pos > self.len {
+            return Err(format!(
+                "rollback to {pos} exceeds the {} cached positions",
+                self.len
+            ));
+        }
+        let kvd = self.w.cfg.kv_dim();
+        let hidden = self.w.cfg.hidden;
+        for k in self.kv_k.iter_mut() {
+            k.truncate(pos * kvd);
+        }
+        for v in self.kv_v.iter_mut() {
+            v.truncate(pos * kvd);
+        }
+        for c in self.captures.iter_mut() {
+            c.truncate(pos * hidden);
+        }
+        self.len = pos;
+        self.cap = pos;
+        Ok(())
     }
 
     pub fn reset(&mut self) {
@@ -292,6 +388,9 @@ impl Model {
         }
         for v in self.kv_v.iter_mut() {
             v.clear();
+        }
+        for c in self.captures.iter_mut() {
+            c.clear();
         }
         self.cap = 0;
     }
@@ -346,7 +445,10 @@ impl Model {
             return Err(format!("token {token} is outside the vocabulary"));
         }
         if pos >= self.max_ctx {
-            return Err(format!("position {pos} exceeds the {}-token cache", self.max_ctx));
+            return Err(format!(
+                "position {pos} exceeds the {}-token cache",
+                self.max_ctx
+            ));
         }
         self.len = pos + 1;
         self.grow();
@@ -363,9 +465,19 @@ impl Model {
         }
 
         for li in 0..cfg.layers {
+            // the layer's input is the residual entering it, exactly the
+            // t_layer_inp[il] = inpL row the reference trunk graph exports
+            if let Some(slot) = self.capture_slots[li] {
+                self.captures[slot].extend_from_slice(&self.scratch.h);
+            }
             self.rope_table(pos, li);
             let layer = &self.w.layers[li];
-            rms_norm(&self.scratch.h, &layer.in_norm, cfg.eps, &mut self.scratch.xn);
+            rms_norm(
+                &self.scratch.h,
+                &layer.in_norm,
+                cfg.eps,
+                &mut self.scratch.xn,
+            );
             matvec(&layer.qkv, &self.scratch.xn, &mut self.scratch.qkv);
             matvec(&layer.attn_gate, &self.scratch.xn, &mut self.scratch.gate);
 
@@ -449,7 +561,12 @@ impl Model {
                 self.scratch.h[i] += self.scratch.o[i];
             }
 
-            rms_norm(&self.scratch.h, &layer.post_norm, cfg.eps, &mut self.scratch.xn);
+            rms_norm(
+                &self.scratch.h,
+                &layer.post_norm,
+                cfg.eps,
+                &mut self.scratch.xn,
+            );
             matvec(&layer.gate, &self.scratch.xn, &mut self.scratch.g);
             matvec(&layer.up, &self.scratch.xn, &mut self.scratch.u);
             for i in 0..cfg.intermediate {
@@ -467,12 +584,9 @@ impl Model {
         }
         /* Tied embeddings: logits = embedding @ hidden. */
         let embed = &self.w.embed;
-        self.logits
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(r, o)| {
-                *o = dot(embed.row(r), &self.scratch.xn);
-            });
+        self.logits.par_iter_mut().enumerate().for_each(|(r, o)| {
+            *o = dot(embed.row(r), &self.scratch.xn);
+        });
         Ok(&self.logits)
     }
 
@@ -494,6 +608,9 @@ impl Model {
     pub fn top(logits: &[f32], n: usize) -> Vec<(u32, f32)> {
         let mut idx: Vec<usize> = (0..logits.len()).collect();
         idx.sort_unstable_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
-        idx.into_iter().take(n).map(|i| (i as u32, logits[i])).collect()
+        idx.into_iter()
+            .take(n)
+            .map(|i| (i as u32, logits[i]))
+            .collect()
     }
 }

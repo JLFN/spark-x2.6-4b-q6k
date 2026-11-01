@@ -627,6 +627,186 @@ always uses the default 128x64 tile, so its artifact-only numbers are the
 heuristic's ceiling. Compare the runtime against the bench only with that in
 mind, and use `--no-tune` to reproduce the bench's matrix path in the runtime.
 
+## 8d. The DSpark draft (speculative decoding for the VQ target)
+
+The draft is a separate dflash checkpoint, models/dspark/Spark-X2.6-4B-DSpark.gguf
+(1.25 GB, BF16 weights, F32 norms). It is not MTP inside the checkpoint: it has
+no token_embd and no output weight, and it borrows the target's embedding and
+LM head, which the VQ runtime has. bin/dspark dump prints the file; the reader
+is tools/dspark/src/gguf.rs.
+
+Architecture, read from the GGUF metadata (bin/dspark dump):
+
+    dflash.block_count                5 blocks, all sliding-window
+    dflash.embedding_length           2560
+    dflash.feed_forward_length        10240, gelu (ggml's tanh form)
+    dflash.attention.head_count       16 q heads / 4 kv, head_dim 256
+    dflash.rope.dimension_count       64 full, 256 swa; theta 5e6 / 1e4
+    dflash.attention.sliding_window   512, pattern [true x 5]
+    dflash.attention.causal           false (block is attended non-causally)
+    dflash.block_size                 7
+    dflash.sample_from_anchor         true
+    dflash.target_layers              [3, 11, 19, 26, 34]
+
+Tensors: per block attn_norm, attn_q/k/v/out, attn_gate [2560x16], ffn_norm,
+ffn_gate/up/down; plus fc [12800x2560] (five hidden states concatenated),
+fc_norm [2560x5], enc.output_norm, output_norm, markov_w1 [256x131072],
+markov_w2 [256x131072], conf_proj [2816x1]. 58 tensors, 1.249 GB.
+
+The reference implementation is the XHToken llama.cpp fork at 22c0ae1,
+src/models/dflash.cpp. It has two graph modes:
+
+- Embd batch (feature injection): the target's hidden states at the five
+  target_layers for the committed positions are normed per layer with fc_norm,
+  projected by fc, normed by enc.output_norm, and their K/V are written into
+  the draft's cache.
+- Token batch (block diffusion): the block [anchor, MASK x 6] is embedded with
+  the target's token_embd, run through the five SWA blocks with attn_gate
+  (sigmoid per head before out_proj), and turned into logits by the target's
+  LM head.
+
+Then the DSpark Markov head rewrites those logits: for each position i of the
+block, logits(i) += markov_w2 @ markov_w1[prev], where prev starts as the
+anchor token and advances by argmax of the biased logits of position i. The
+optional confidence head is sigmoid(conf_proj . [hidden(i); markov_w1[prev]]).
+With sample_from_anchor true, position 0 is a real draft slot.
+
+The support is metadata-driven by design: the converter emits a role manifest
+(dimensions, rope, activation, window, block size, target layers and which
+optional heads exist) and the executor takes all of it from that manifest, with
+one tensor-name table and no per-checkpoint constants. The plan is handoff
+section 4; the same rule as the kernel tuner applies, describe and measure the
+model rather than specialize the tool to it.
+
+Convert and check (phase A, done). The tool path is:
+
+    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf
+    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft [--force] [--verify]
+    ./bin/dspark check out/draft
+
+convert copies the tensor bytes into out/draft/weights.bin (64-byte aligned,
+one region per tensor) and writes out/draft/manifest.txt, the role manifest.
+It never decodes a weight; --verify re-reads the output and compares every
+region with the source, which is what backs that claim. It refuses, by tensor
+name, a quantized tensor, a name no role maps, a known role this build does not
+implement (dflash2 conv, selector, lilicorr, attn_sinks, rope_freqs, a draft
+that ships its own embedding or head), and a shape the metadata contradicts.
+check validates the directory alone: every shape is re-derived from the
+manifest's own header, the regions must tile weights.bin with only alignment
+padding between them, and those padding bytes are read to prove they are zero.
+A truncated tensor, an edited offset, a missing required role or a foreign
+architecture is refused with the tensor or field named.
+
+Measured 2026-10-31 on the released draft: 58 tensors, 1,248,919,044 bytes of
+source weights, the same 1,248,919,044 bytes in weights.bin (this file needs no
+alignment padding at all), conversion 3.7 s with --verify, and two runs produce
+a bit-identical weights.bin and manifest. A copy with one tensor's byte count
+reduced by 4 is refused as "tensor attn_q 0: 20971516 bytes recorded, but BF16
+2560x4096 is 20971520 bytes"; a weights.bin truncated by 4 bytes is refused as
+"the last tensor conf_bias ends at byte 1248919044, but weights.bin is
+1248919040 bytes".
+
+The manifest's tensor line is role, layer (0-based, -1 global), dtype code
+(0 F32, 1 F16, 2 BF16), ne0, ne1, offset, bytes. Shapes are the GGUF shapes:
+ne0 is the fastest-varying dimension, so a weight that turns a 2560-vector into
+4096 values is 2560x4096, and fc is 12800x2560 (five target layers x hidden in,
+hidden out). Three fields go beyond the handoff's first sketch: vocab, so the
+Markov head validates without a target; mask_token, read from
+tokenizer.ggml.mask_token_id and checked against vocab, because the block's
+noise slots need it and the draft ships no vocabulary; and the conf_bias role,
+because conf_proj ships a bias in the reference.
+
+Status (2026-11-01, branch feature/dspark-vq): phases A, B, C and D are
+implemented. The reader, the dump, the converter, the checker, the CPU draft
+forward and the CPU propose/verify loop are phase A/B. Phase C is the GPU
+executor: vq-model-gpu captures the target layer-input rows at layers 3, 11,
+19, 26 and 34 into a position-major device buffer, verify_logits returns the
+tied-head logits for every row of a verification batch, and dspark-gpu.h
+runs the feature encoder, the block decoder (S independent blocks), the
+Markov chain and the confidence head on the same device. The draft weights
+are loaded as f32 from the manifest and multiplied with cuBLAS, so the GPU
+follows the CPU gate; the target keeps its VQ kernels. The draft's K/V cache
+holds the injected target features for committed positions, the block's own
+K/V stay in the per-round row buffer, and no host round-trip is needed
+between the target verify and the next draft block. Phase D is `--bench`,
+which runs the spec path and the plain greedy baseline in one process and
+prints the break-even acceptance.
+
+Run one block from a capture (the first-block gate):
+
+    ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349 \
+        --capture-layers 3,11,19,26,34 --capture /tmp/hid.bin
+    ./bin/dspark forward --draft out/draft --hidden /tmp/hid.bin \
+        --target models/hf --anchor 390 --pos0 4
+
+Run the full propose/verify loop (the 64-token gate):
+
+    ./bin/dspark spec --draft out/draft --target models/hf \
+        --ids 1046,11862,314,17349,390 --gen 64 --rounds --out /tmp/ids.txt
+    ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 \
+        --weights vq --ids 1046,11862,314,17349,390 --gen 64
+
+The GPU path runs the same loop inside vq-model-gpu, with the target and the
+draft on one device and no host round-trip between a verify and the next
+draft block:
+
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+        --draft out/draft --out /tmp/gpu-ids.txt
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --ctx 4096 --draft out/draft --gate1
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+        --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+        --draft out/draft --bench
+
+The prompt ids are "The capital of France is" from llama.cpp /tokenize with
+add_special false; the reference holds the last prompt token (390) back as the
+first anchor, which is what both commands above do.
+
+Measured gates, 2026-10-31:
+
+- First block, BF16 and VQ captures: proposals [220 30 35 29 27 198 198],
+  exactly the ids the instrumented reference fork logs for the same state
+  (llama-speculative-simple, --spec-type draft-dspark, --spec-draft-n-max 7,
+  temp 0, top-k 0). Per-row logits differ slightly between CPU f32 and the
+  CUDA BF16 reference; every argmax is identical.
+- 64-token greedy, BF16 target: generated ids identical to the reference
+  fork's committed ids, 18 rounds, 126 drafted, 51 accepted (40.476%). 16 of
+  18 full draft blocks are identical. Round 7's second proposal is a near-tie
+  (ours 34:25.559708 against 614:25.553513; the reference 614:25.562506
+  against 34:25.534792) and both are rejected, so the committed ids do not
+  move. Round 18 differs only because the reference clamps the final block to
+  the remaining generation budget while this loop keeps the full block; the
+  first 64 ids still match.
+- 64-token greedy, VQ 4x8192 x2 target: the speculative ids are identical to
+  that VQ target's own greedy continuation (vq-runtime --weights vq --gen 64),
+  11 rounds, 77 drafted, 53 accepted (68.831%). The VQ continuation is not the
+  BF16 one: after the first tokens the 64-token run settles into the cycle
+  19500, 390, 275, 11862, 314, 17349, 27. That is the quantization's effect
+  on the target, not a chain error: the chain is exact for the target it
+  runs.
+- CPU speed is reference speed, not a product number: the 64-token BF16 chain
+  takes 61.4 s of decode after a 26 s weight load, about 1.1 committed
+  tok/s; the VQ chain takes 38.3 s of decode after a 20 s load.
+- GPU phase C, 2026-11-01, VQ 4x8192 x2 target: the GPU spec ids are
+  byte-identical to the CPU spec ids (11 rounds, 77 drafted, 53 accepted,
+  68.831%). The verify tail uses per-row GEMV for the tied head; routing
+  those logits through prefill_mat changed the first token (220 against the
+  correct 19500), so verify_logits stays on the same GEMV as tail_logits.
+- Gate 1, batch permutation invariance: four blocks with different anchors
+  run in one batch and then in a permuted batch; maxabs 0 over 28 rows of
+  131072 logits, no argmax or proposal mismatch.
+- Phase D bench, same prompt and device, two runs: spec 85.96-89.25 tok/s
+  against a 69.40-70.81 tok/s greedy baseline (1.25-1.29x), round 63.8-66.9
+  ms (draft 13.9-14.2 ms, verify 49.6-52.4 ms), break-even acceptance
+  50.3-52.1% per drafted token against the measured 68.8%. The handoff's
+  earlier ~0.3 estimate was optimistic: the measured draft cost puts
+  break-even at 50-52%, and 68.8% still clears it.
+
+Gate 1 is met. The GPU block decoder runs four independent blocks in one
+batch, then the same blocks in a permuted order; the logits are bit-identical
+(maxabs 0) and every argmax and proposal matches.
+
 ## 9. Pitfalls that cost time here
 
 - Do not trust a hardcoded context. `config.json` says 1,048,576; the repo serves
@@ -657,8 +837,10 @@ mind, and use `--no-tune` to reproduce the bench's matrix path in the runtime.
     tools/vq/gpu/decode-gpu.cu  CUDA decode, GEMV, tiled prefill kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
+    tools/vq/gpu/dspark-gpu.h    GPU draft executor, gates and bench (phases C/D)
     tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
     tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
+    tools/dspark/       DSpark draft reader, converter and checker (bin/dspark, section 8d)
     tools/kquant/      vendored llama.cpp quantizer for the comparison numbers
     tools/runtime/     fetch and build the pinned llama.cpp trees
     models/hf/         the checkpoint the VQ path reads (not in git)

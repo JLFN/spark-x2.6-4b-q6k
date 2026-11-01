@@ -629,6 +629,14 @@ typedef struct {
      * xT is [hidden][chunk], and every other batch buffer is [chunk][rows]. */
     int chunk, prefill_ok;
     float * hb, * xb, * xT, * qkv_b, * g_b, * attn_b, * attn_t, * mlp_gb, * mlp_ub, * act_b, * act_t;
+    /* Layer-input capture for a draft. cap_slot[li] is the destination slot
+     * for target layer li, or -1 when that layer is not captured. cap is
+     * [cap_n][ctx][hidden], position-major, written by forward_batch before
+     * the layer runs (the same row vq-runtime captures). */
+    int cap_n;
+    int cap_layer[8];
+    int * cap_slot;
+    float * cap;
 } Model;
 
 static float * dev_f32(size_t n) {
@@ -682,10 +690,50 @@ static int alloc_model(Model * m, const Cfg * c, int ctx, int chunk) {
     m->mlp_ub = dev_f32(nt * (size_t) c->inter);
     m->act_b = dev_f32(nt * (size_t) c->inter);
     m->act_t = dev_f32(nt * (size_t) c->inter);
+    m->cap_n = 0;
+    m->cap = NULL;
+    m->cap_slot = (int *) malloc((size_t) c->layers * sizeof(int));
+    if (m->cap_slot)
+        for (int li = 0; li < c->layers; li++) m->cap_slot[li] = -1;
     return (m->kv_k && m->kv_v && m->h && m->xn && m->qkv && m->g16 && m->attn &&
             m->mlp_g && m->mlp_u && m->act && m->logits && m->hb && m->xb && m->xT &&
             m->qkv_b && m->g_b && m->attn_b && m->attn_t && m->mlp_gb && m->mlp_ub &&
-            m->act_b && m->act_t) ? 0 : -1;
+            m->act_b && m->act_t && m->cap_slot) ? 0 : -1;
+}
+
+/* Turn on layer-input capture for the target layers a draft names. The buffer
+ * is position-major per slot, so a later round can read the committed rows
+ * without a host copy. */
+static int enable_capture(Model * m, const int * layers, int n) {
+    if (n <= 0 || n > 8) {
+        fprintf(stderr, "capture: %d layers requested, the limit is 8\n", n);
+        return -1;
+    }
+    if (m->cap) {
+        fprintf(stderr, "capture: already enabled\n");
+        return -1;
+    }
+    for (int k = 0; k < n; k++) {
+        const int li = layers[k];
+        if (li < 0 || li >= m->c.layers) {
+            fprintf(stderr, "capture: layer %d is outside 0..%d\n", li, m->c.layers);
+            return -1;
+        }
+        if (m->cap_slot[li] >= 0) {
+            fprintf(stderr, "capture: layer %d is listed twice\n", li);
+            return -1;
+        }
+        m->cap_slot[li] = k;
+        m->cap_layer[k] = li;
+    }
+    m->cap_n = n;
+    m->cap = dev_f32((size_t) n * (size_t) m->ctx * (size_t) m->c.hidden);
+    if (!m->cap) {
+        fprintf(stderr, "capture: cannot allocate %d x %d x %d floats\n",
+                n, m->ctx, m->c.hidden);
+        return -1;
+    }
+    return 0;
 }
 
 static int load_model(Model * m, const char * dir) {
@@ -837,6 +885,16 @@ static int forward_batch(Model * m, const uint32_t * ids, int t0, int ntok) {
         Layer * L = &m->layers[li];
         const int full = c->full[li];
 
+        if (m->cap_n && m->cap_slot[li] >= 0) {
+            const int slot = m->cap_slot[li];
+            if (ck(cudaMemcpy2DAsync(
+                       m->cap + ((size_t) slot * m->ctx + (size_t) t0) * c->hidden,
+                       (size_t) c->hidden * 4, m->hb, (size_t) c->hidden * 4,
+                       (size_t) c->hidden * 4, ntok, cudaMemcpyDeviceToDevice),
+                   "capture copy"))
+                return -1;
+        }
+
         rmsnorm_batch_kernel<<<ntok, 256>>>(m->hb, L->in_norm, m->xb, c->hidden, c->eps);
         transpose_f32_kernel<<<dim3((c->hidden + 31) / 32, (ntok + 31) / 32), dim3(32, 32)>>>(
             m->xb, m->xT, ntok, c->hidden);
@@ -891,6 +949,25 @@ static int tail_logits(Model * m, const float * h_last) {
     return gemv(&m->embed, m->xn, m->logits);
 }
 
+/* A verification batch: process `ntok` tokens at t0 (capture stays on when a
+ * draft enabled it), then produce the tied-head logits for every row, not only
+ * the last one the prompt tail wants. `logits` is [ntok][vocab] device f32. */
+static int verify_logits(Model * m, const uint32_t * ids, int t0, int ntok, float * logits) {
+    if (forward_batch(m, ids, t0, ntok)) return -1;
+    /* The same tail as tail_logits, once per row: the prompt path's single
+     * GEMV is the reference this batch must match, so do not route the tied
+     * head through the prefill kernel until it is shown to agree. */
+    for (int r = 0; r < ntok; r++) {
+        rmsnorm_kernel<<<1, 256>>>(m->hb + (size_t) r * m->c.hidden, m->d_norm,
+                                   m->xn, m->c.hidden, m->c.eps);
+        if (ck(cudaMemsetAsync(logits + (size_t) r * m->c.vocab, 0,
+                               (size_t) m->c.vocab * 4), "memset verify logits"))
+            return -1;
+        if (gemv(&m->embed, m->xn, logits + (size_t) r * m->c.vocab)) return -1;
+    }
+    return 0;
+}
+
 static int argmax_dev(const Model * m) {
     int * d = NULL;
     if (ck(cudaMalloc((void **) &d, 4), "cudaMalloc argmax")) return -1;
@@ -900,6 +977,8 @@ static int argmax_dev(const Model * m) {
     cudaFree(d);
     return best;
 }
+
+#include "dspark-gpu.h"
 
 /* ------------------------------------------------------------------ main -- */
 
@@ -914,7 +993,14 @@ static const char * USAGE =
     "  --profile PATH    tuning profile (default DIR/vq-tune.profile when present)\n"
     "  --no-tune         ignore any tuning profile\n"
     "  --top N           print the N best next tokens (default 5)\n"
-    "  --logits FILE     write the last prompt position's f32 logits\n";
+    "  --logits FILE     write the last prompt position's f32 logits\n"
+    "  --draft-info DIR  read a converted draft and print its header, no target\n"
+    "  --draft DIR       run the DSpark propose/verify loop against the target\n"
+    "  --n-max K         draft tokens per round (default the manifest block_size)\n"
+    "  --rounds          print one line per speculative round\n"
+    "  --out FILE        write the generated ids to FILE\n"
+    "  --gate1           batch permutation invariance across four draft blocks\n"
+    "  --bench           run the spec path and the greedy baseline, report break-even\n";
 
 static int parse_ids(const char * s, uint32_t ** out, int * n) {
     char * copy = strdup(s);
@@ -944,8 +1030,10 @@ static int parse_ids(const char * s, uint32_t ** out, int * n) {
 
 int main(int argc, char ** argv) {
     const char * dir = NULL, * cfg_path = "models/hf/config.json", * ids_arg = NULL;
-    const char * logits_out = NULL, * profile_arg = NULL;
+    const char * logits_out = NULL, * profile_arg = NULL, * draft_info = NULL;
+    const char * draft_dir = NULL, * out_path = NULL;
     int gen = 0, ctx = 4096, topn = 5, chunk = 512, no_prefill = 0, no_tune = 0;
+    int n_max = 0, trace = 0, gate1 = 0, bench = 0;
 
     for (int i = 1; i < argc; i++) {
         const char * a = argv[i];
@@ -961,13 +1049,36 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--no-tune")) { no_tune = 1; }
         else if (!strcmp(a, "--top") && val) { topn = atoi(val); i++; }
         else if (!strcmp(a, "--logits") && val) { logits_out = val; i++; }
+        else if (!strcmp(a, "--draft-info") && val) { draft_info = val; i++; }
+        else if (!strcmp(a, "--draft") && val) { draft_dir = val; i++; }
+        else if (!strcmp(a, "--n-max") && val) { n_max = atoi(val); i++; }
+        else if (!strcmp(a, "--rounds")) { trace = 1; }
+        else if (!strcmp(a, "--gate1")) { gate1 = 1; }
+        else if (!strcmp(a, "--bench")) { bench = 1; }
+        else if (!strcmp(a, "--out") && val) { out_path = val; i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { fputs(USAGE, stdout); return 0; }
         else { fprintf(stderr, "unknown argument %s\n%s", a, USAGE); return 2; }
     }
-    if (!dir || !ids_arg) { fputs(USAGE, stderr); return 2; }
     if (ctx < 2 || gen < 0 || topn < 1) { fprintf(stderr, "bad --ctx, --gen or --top\n"); return 2; }
     if (chunk < 1) { fprintf(stderr, "bad --chunk\n"); return 2; }
     if (chunk > ctx) chunk = ctx;
+
+    if (draft_info) {
+        Draft d;
+        if (draft_open(&d, draft_info, ctx)) return 2;
+        printf("draft       %s, %d layers, %d hidden, %d ffn, %d heads / %d kv of %d\n",
+               d.m.arch, d.layers, d.hidden, d.ffn, d.heads, d.kv_heads, d.head_dim);
+        printf("draft       vocab %d, mask %d, block %d, anchor mode %d, swa %d, causal %d\n",
+               d.vocab, d.mask_token, d.block_size, d.anchor_mode, d.swa_window, d.causal);
+        printf("draft       targets [");
+        for (int i = 0; i < d.n_target; i++)
+            printf("%d%s", d.target_layers[i], i + 1 < d.n_target ? ", " : "");
+        printf("], markov %d, confidence %d, tensors %d\n",
+               d.has_markov, d.has_conf, d.m.n_tensors);
+        return 0;
+    }
+
+    if (!dir || !ids_arg) { fputs(USAGE, stderr); return 2; }
 
     Cfg c;
     if (parse_config(cfg_path, &c)) return 2;
@@ -1021,6 +1132,23 @@ int main(int argc, char ** argv) {
     printf("weights     %s (%.2f GB container streamed per token, %.2f GB free of %.2f GB after load) in %.1f s\n",
            dir, (double) g_container_bytes / 1e9, (double) fr / 1e9, (double) tot / 1e9,
            now_s() - t_load);
+
+    if (draft_dir) {
+        Draft d;
+        if (draft_open(&d, draft_dir, ctx)) return 2;
+        printf("draft       %s, %d layers, block %d, anchor mode %d, markov %d, confidence %d\n",
+               d.m.arch, d.layers, d.block_size, d.anchor_mode, d.has_markov, d.has_conf);
+        if (gate1) {
+            const int rc = draft_gate1(&d, &m, ids, nids);
+            return rc == 0 ? 0 : 2;
+        }
+        if (bench) {
+            const int rc = draft_bench(&d, &m, ids, nids, gen, n_max);
+            return rc == 0 ? 0 : 2;
+        }
+        if (draft_spec_run(&d, &m, ids, nids, gen, n_max, trace, out_path, NULL)) return 2;
+        return 0;
+    }
 
     const int use_prefill = (!no_prefill && m.prefill_ok);
     if (use_prefill)

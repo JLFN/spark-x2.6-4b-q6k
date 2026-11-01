@@ -1,9 +1,31 @@
+--- handoff probe (auto) ---
+=== handoff probe (Spark-X2.6-4B-Base) ===
+--- end handoff probe ---
+
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. HEAD is the commit that
-carries this handoff (docs(agents): how to use the kernel tuner), and
-origin/master is behind it until the push is approved. The working tree is
-clean once that commit exists.
+Date: 2026-11-01. Repo: /data/Spark-X2.6-4B-Base. The active branch is
+feature/dspark-vq, forked from master at 24eca9e, with these commits on it:
+
+    8134077  feat(dspark): a GGUF reader and the draft architecture dump
+    33f0599  docs(handoff): the DSpark draft starts
+    680fc41  docs(handoff): the generic draft plan
+    8ec385e  docs(handoff): refresh the position for compaction
+    168ee3d  feat(dspark): convert a draft to a role manifest and check it
+    13ea07f  feat(vq-runtime): a library target with capture, rollback and
+             embedding access
+    ae2989c  feat(dspark): the CPU draft forward and the propose/verify loop
+    9a075ed  docs(dspark): record the phase B gate and the draft commands
+    97c67bb  feat(dspark): the GPU executor, propose/verify loop and bench
+    37f51df  docs(handoff): record the phase C/D commit
+    7637e1b  refactor(dspark): name the GPU draft header .h so the graph parses it
+    eb4f6ea  docs(dspark): report the bench run-to-run range
+
+plus the docs commit that carries this handoff. master is 10 commits ahead of
+origin/master and unpushed until that is approved; nothing on the branch is
+pushed either. The QA gate for this unit was explicitly waived by the user on
+2026-11-01 ("No QA"); the waiver is recorded here and in the project memory,
+and no push has happened.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -46,6 +68,25 @@ result. Where a number is missing it says so.
   fingerprint and the device name match. On 4x8192 x2 the profile is
   bit-identical to the heuristic and moves a 500-token prompt from 892.3 to
   917.8 tok/s (section 2).
+- DSpark draft: models/dspark/Spark-X2.6-4B-DSpark.gguf is read by the new
+  bin/dspark dump (tools/dspark), and its architecture is recorded in AGENTS.md
+  section 8d: 5 SWA blocks, 2560 hidden, 16/4 heads x 256, ggml's tanh gelu,
+  block size 7, target layers [3, 11, 19, 26, 34], and a Markov head over the
+  block. Phase A is done: bin/dspark convert writes out/draft (weights.bin plus
+  the role manifest) and bin/dspark check validates it, measured in section 2.
+  Phase B is done too: vq-runtime is now a library, the target captures its
+  layer-input rows and rolls both caches back after a partial acceptance, and
+  bin/dspark forward / bin/dspark spec run the draft block and the full CPU
+  propose/verify loop. On the 64-token greedy gate the generated ids are
+  identical to the instrumented reference fork (BF16 target) and identical to
+  the VQ target's own greedy continuation (VQ 4x8192 x2 target), with
+  acceptance 40.476% and 68.831% respectively (section 2). Phases C and D are
+  done: vq-model-gpu captures the target layer inputs, runs the draft on the
+  same device through cuBLAS, verifies a batch and rolls the committed prefix
+  forward. Gate 1 passes bitwise, the GPU ids are identical to the CPU VQ
+  spec ids, and the bench measures 85.96-89.25 tok/s against a 69.40-70.81
+  tok/s greedy baseline (1.25-1.29x) with a 50.3-52.1% break-even acceptance
+  against the measured 68.831%.
 
 ## 2. Measurements (do not re-derive)
 
@@ -196,6 +237,75 @@ sweep itself takes about 4 s per artifact. A DQVQ artifact sweeps too, but
 records legacy prefill for every geometry (no tiled path), so its prompt stays
 token by token.
 
+Draft economics, ESTIMATES ONLY (2026-10-31; the only measured input is the
+14.1 ms/token decode). A 7-token verification pass streams the target
+container once, so it should cost about one decode pass (11-14 ms) rather than
+seven. The draft block reads 1.249 GB of BF16, so 4-6 ms on this card. Round
+cost is therefore about 18-20 ms, and the expected accepted tokens per round
+for per-token acceptance a with k = 6 is (1 - a^7)/(1 - a):
+
+    a 0.20 -> 1.25 accepted -> 17.6 ms of decode for 20 ms -> 0.88x
+    a 0.30 -> 1.43 accepted -> 20.2 ms -> 1.01x
+    a 0.40 -> 1.66 accepted -> 23.4 ms -> 1.17x
+    a 0.50 -> 1.98 accepted -> 27.9 ms -> 1.40x
+    a 0.70 -> 3.20 accepted -> 45.1 ms -> 2.25x
+
+Break-even sits near 0.3 in this estimate, and this draft measured 0.20-0.32
+on the Q6_K and Q4_K_M targets. The estimate is superseded by the phase C/D
+measurement below: the draft costs 13.9 ms per round, the verify 49.6 ms,
+and the measured break-even is 50.3% per drafted token, not 30%.
+
+Draft phase B gate, MEASURED 2026-10-31 on the CPU chain (tools/dspark spec),
+prompt [1046, 11862, 314, 17349, 390], greedy, block size 7:
+
+    BF16 target (models/hf), 64 generated ids
+        ids identical to the reference fork's committed ids (instrumented
+        llama-speculative-simple, --spec-type draft-dspark, -n 64, temp 0)
+        18 rounds, 126 drafted, 51 accepted, acceptance 40.476%
+        16 of 18 full draft blocks identical; round 7 row 1 is a near-tie
+        (ours 34:25.559708 / 614:25.553513, reference 614:25.562506 /
+        34:25.534792), both rejected, so the committed ids do not move;
+        round 18 differs only because the reference clamps its last block to
+        the remaining budget
+        decode 61.4 s after a 25.9 s weight load, 1.12 committed tok/s
+    VQ 4x8192 x2 target (models/vq-build-8192-2-v3), 64 generated ids
+        ids identical to that target's own greedy continuation
+        (vq-runtime --weights vq --gen 64)
+        11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
+        decode 38.3 s after a 20 s weight load, 1.67 committed tok/s
+        the VQ continuation differs from the BF16 one: after the first
+        tokens it settles into the cycle 19500, 390, 275, 11862, 314,
+        17349, 27; the chain is exact for its target, the target is the
+        quantized one
+
+The first-block gate also matches on both captures: proposals
+[220 30 35 29 27 198 198], exactly the reference's logged ids. Per-row logits
+differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
+
+Draft phase C/D gate, MEASURED 2026-11-01 on the GPU chain (vq-model-gpu,
+tools/vq/gpu/dspark-gpu.h), same prompt and target:
+
+    GPU spec, 64 generated ids
+        ids byte-identical to the CPU VQ spec ids above
+        11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
+        decode 0.72-0.74 s after the target load, 85.96-89.25 tok/s
+        round 63.8-66.9 ms (draft 13.9-14.2 ms, verify 49.6-52.4 ms)
+    gate 1, four blocks with different anchors in two orders
+        28 rows x 131072 logits, maxabs 0, no argmax or proposal mismatch
+    baseline, same process and device
+        69.40-70.81 tok/s greedy (14.1-14.4 ms/token)
+        speedup 1.25-1.29x at the measured acceptance
+        break-even acceptance 50.3-52.1% per drafted token (measured 68.831%)
+    trap: verify_logits must use the same per-row GEMV as tail_logits for
+        the tied head. Routing the 8-row verify logits through prefill_mat
+        changed the first token from 19500 to 220; the per-row GEMV matches
+        the prompt path exactly.
+
+The GPU draft weights are loaded as f32 from the manifest and multiplied
+with cuBLAS; the target keeps its VQ kernels. The draft K/V cache holds the
+injected target features for committed positions and the block's own K/V
+stay in the per-round row buffer.
+
 ## 3. Decisions and why
 
 - DQV3 is the payload to build. Same container size, same quality, and it is
@@ -219,53 +329,203 @@ token by token.
   f32 -> f16, which the host f64 gate prices at relL2 0.0159%.
 - The Rust tools are a cargo workspace (tools/Cargo.toml). build.sh fails when
   cargo is missing; there is no "skipped rustc" branch any more.
+- The draft support is metadata-driven by design. The GGUF is the authority for
+  layer count, dimensions, rope, activation, window, block size, target layers
+  and which optional heads exist; the code carries a role vocabulary and one
+  tensor-name table, never one model's numbers. This is the same rule the
+  kernel tuner follows: measure and describe the model, do not specialize the
+  tool to it. A draft with a head this build does not implement must fail
+  loudly by name, not silently skip it, because a silently skipped head changes
+  the proposals without changing the shape.
 - The block kernel is not further tuned here. ds4's version is pinned at the
   64-register wall and its two escalation attempts measured negative there.
 
 ## 4. Open work, in priority order
 
-1. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
+1. Generic draft (speculative decoding) support. ACTIVE, branch
+   feature/dspark-vq. The deliverable is a tool path, not a second runtime
+   hardcoded to one checkpoint: any dflash-style draft GGUF is converted once
+   into a role manifest, and the executor takes every dimension, activation,
+   rope parameter and optional head from that manifest. The target side is
+   reached through one small interface (embedding rows, LM head, hidden states
+   at the draft's declared target_layers), so the same draft code can serve the
+   VQ runtime or the CPU reference. The only per-family text in the code is the
+   tensor-name table, and it lives in one place.
+
+   Phase A, converter and check (Rust, tools/dspark). DONE 2026-10-31.
+
+       dspark convert DRAFT.gguf OUTDIR [--force] [--verify]
+       dspark check OUTDIR
+
+   OUTDIR holds weights.bin (64-byte aligned, one region per tensor) and
+   manifest.txt, line oriented, no quoting:
+
+       DRAFT 1
+       arch dflash
+       hidden 2560
+       layers 5
+       ffn 10240
+       heads 16
+       kv_heads 4
+       head_dim 256
+       vocab 131072
+       rope_full_dims 64
+       rope_swa_dims 256
+       rope_full_theta 5000000
+       rope_swa_theta 10000
+       eps 0.000001
+       act gelu
+       swa_window 512
+       swa_pattern 1,1,1,1,1
+       causal 0
+       block_size 7
+       sample_from_anchor 1
+       target_layers 3,11,19,26,34
+       tensor attn_norm 0 0 2560 1 0 10240
+       tensor fc -1 2 12800 2560 1049088000 65536000
+       ...
+       end
+
+   The tensor line is: role, layer index (0-based; -1 for a global tensor),
+   dtype code (0 F32, 1 F16, 2 BF16; quantized codes are refused until a
+   kernel exists for them), ne0, ne1, byte offset, byte count. Shapes are the
+   GGUF shapes, so ne0 is the fastest-varying dimension: blk.0.attn_norm is
+   F32 2560x1, and fc is BF16 12800x2560 (five target layers of hidden in,
+   hidden out, which is how the reference creates it: n_embd_inp, n_embd).
+   Roles are the vocabulary both sides share: attn_norm, attn_q, attn_k,
+   attn_v, attn_out, attn_gate, attn_q_norm, attn_k_norm, attn_post_norm,
+   ffn_norm, ffn_gate, ffn_up, ffn_down, ffn_post_norm, layer_out_scale, and
+   the globals fc, fc_norm, enc_norm, output_norm, markov_w1, markov_w2,
+   conf_proj, conf_bias. Capabilities are derived from role presence: markov
+   needs markov_w1+w2, confidence needs conf_proj+conf_bias, and attn_gate
+   excludes the q/k norms. A GGUF tensor that maps to no role is an error,
+   never ignored, and so is a known role this build does not implement
+   (dflash2 conv, selector, lilicorr, attn_sinks, rope_freqs, a draft with its
+   own embedding or head). This checkpoint has neither conv nor selector nor
+   lilicorr tensors, so those name mappings are deliberately unimplemented
+   rather than guessed from an unseen file.
+
+   check validates every shape against the header: q = heads*head_dim,
+   k/v = kv_heads*head_dim, ffn, fc = len(target_layers)*hidden x hidden,
+   markov = rank x vocab, and that the offsets tile weights.bin exactly (first
+   region at 0, 64-byte aligned, no overlap, only sub-64-byte alignment gaps,
+   last region ending at the file's length). It also reads the padding bytes to
+   prove they are zero.
+
+   Acceptance, met 2026-10-31: the Spark draft converts and checks with 58
+   tensors and 1,248,919,044 bytes of source weights, the same byte count in
+   weights.bin (this file happens to need no padding), in 3.7 s with --verify,
+   and two runs are bit-identical. A manifest with one tensor's byte count cut
+   by 4 is refused as "tensor attn_q 0: 20971516 bytes recorded, but BF16
+   2560x4096 is 20971520 bytes"; a weights.bin cut by 4 bytes is refused as
+   "the last tensor conf_bias ends at byte 1248919044, but weights.bin is
+   1248919040 bytes"; unknown roles, missing roles, a foreign arch, a wrong
+   swa_pattern length, a half-present gate family, non-zero padding and a
+   64-byte gap are each refused with the field or tensor named. The earlier
+   figure 1,249,293,824 in this file was the GGUF file length, not the weight
+   bytes; the converter's own sum and a hand sum of the 58 tensor sizes agree
+   on 1,248,919,044.
+
+   Phase B, CPU draft forward and the propose/verify loop (Rust). DONE
+   2026-10-31.
+
+       vq-runtime --weights hf --dir models/hf --ids IDS \
+           --capture-layers 3,11,19,26,34 --capture FILE
+       dspark forward --draft OUTDIR --hidden FILE --target DIR --anchor ID \
+           [--pos0 N] [--n-draft K]
+       dspark spec --draft OUTDIR --target DIR --ids LIST --gen N \
+           [--weights hf|vq] [--n-max K] [--rounds] [--trace-logits]
+
+   tools/vq-runtime is a library plus a thin binary now. The model, config,
+   safetensors and VQ-source modules are public, Model::forward appends the
+   layer-input row to a capture slot at the start of every requested layer,
+   Model::embed_row exposes the tied embedding, and Model::rollback truncates
+   the KV cache and the captures to the committed length. The draft decoder
+   takes a TargetEmbed trait, implemented by the target Model and by the
+   standalone safetensors Embedding, so the loop reads the target's embedding
+   in place instead of loading a second 131072 x 2560 copy.
+
+   The loop is the reference's, not an approximation of it:
+   the target holds pos0 committed positions and an unprocessed anchor at
+   pos0; the draft block runs at pos0..pos0+n_draft-1, anchor first; the
+   target verifies [anchor, p0, ..., p_{n-1}] at pos0..pos0+n_draft, row
+   pos0+i predicting proposal i; the first mismatch k commits p0..p_{k-1}
+   and the target's own token at row pos0+k; the target keeps rows 0..k and
+   the next anchor is the target token at pos0+k+1. The draft's injected
+   features are the target layer inputs of the committed rows, so the same
+   rollback truncates both caches. The manifest's mask_token (2, from
+   tokenizer.ggml.mask_token_id) fills the noise slots.
+
+   Gate 1 (permutation invariance across a batch of blocks) is met on the GPU
+   executor: four blocks with different anchors, run in two batch orders,
+   produce bit-identical logits (maxabs 0) and identical proposals.
+
+   Gate 2 (reference fork, 64-token greedy) is met, measured in section 2:
+   identical generated ids and identical acceptance on the BF16 target, and
+   identical ids to the VQ target's own greedy continuation on the VQ target.
+   Acceptance is 40.476% on BF16, above the 0.20-0.32 the Q6_K and Q4_K_M
+   targets measured, and 68.831% on VQ 4x8192 x2, well above the ~0.3
+   break-even the economics estimate names.
+
+   Phase C, GPU executor and integration (CUDA). DONE 2026-11-01.
+
+   - Draft kernels: the draft shares the target's head geometry (16 heads of
+     256, 4 KV heads), so the existing norm, rope, attention and GEMV shapes
+     are reused; its weights are BF16 or F16 from the manifest, so one GEMM
+     path serves them.
+   - Target interface in vq-model-gpu: forward_batch copies the hidden state
+     after each layer listed in target_layers into a [ntok][hidden] buffer, and
+     a verification call returns logits for every drafted position, not only
+     the last row the prompt tail computes today. Both are additive; the
+     existing decode path keeps its current cost when no draft is attached.
+   - Draft cache: a K/V ring per layer holding injected target features for
+     committed positions; injection runs on committed tokens only, and the
+     draft block attends over that ring plus the block itself.
+   - Propose/verify: propose up to block_size tokens, verify with one target
+     forward_batch, accept the longest common prefix, repeat. Greedy only until
+     the acceptance number exists.
+   - Acceptance for phase C: met. The GPU ids are byte-identical to the CPU
+     VQ spec ids at temperature 0; the end-to-end rate is 85.96-89.25 tok/s
+     against the 69.40-70.81 tok/s greedy baseline, with acceptance 68.831%.
+
+   Phase D, measurement and the decision. DONE 2026-11-01.
+
+       ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 \
+           --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 \
+           --draft out/draft --bench
+
+   The bench runs the spec path and the plain greedy baseline in one process
+   and reports acceptance, accepted and committed tokens per round, draft ms,
+   verify ms, tok/s and the break-even acceptance for the measured round
+   cost. The measured break-even is 50.3-52.1% per drafted token; the
+   measured acceptance is 68.831%, so the feature is a 1.25-1.29x win on this
+   target. The earlier ~0.3 estimate was optimistic because the draft block
+   costs 13.9-14.2 ms, not the 4-6 ms assumed in section 2.
+
+2. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
    and gated (section 2), and the tile shapes are now measured per geometry
    (851-918 tok/s at 500-512 tokens against 1743-1909 tok/s for artifact-only
    matrix work), so roughly half the prompt time is the batched attention,
-   four transposes per layer, the norms and 512 embedding row dequeues. Candidate work, in the order the numbers suggest: batch the
-   embedding row dequeue into one launch; fuse the transpose into the norm and
-   gelu kernels; and revisit the B-tile load's 4-way bank conflict (it reads
-   xT column-major and writes shared token-major) plus a 256-token B tile if
-   shared memory allows. Acceptance: raise the 512-token prompt rate without
-   changing the logits beyond the f16 gate in section 2 (argmax and top-25
-   must hold, and the new relL2 is reported).
-2. DSpark in the VQ runtime. DEFERRED on purpose (2026-10-31), not forgotten.
-   DSpark is this model's MTP equivalent and it is already wired on the
-   llama.cpp path (measured 1.13-1.40x there), but it is not wired into the VQ
-   runtime. The prompt path is now fast enough that this is a priority
-   decision rather than a dependency. When it is taken up, the work is: expose
-   target hidden states at five layers, load the draft GGUF, implement the
-   5-block SWA dflash graph with attn_gate and gelu, then the propose/verify
-   loop. Acceptance against a VQ target is unmeasured and must be measured,
-   because the draft was trained on bf16 hidden states and VQ shifts them
-   (manifest relL2 about 2.8-3.4 per tensor).
-
-Why "add MTP" is not an option, checked 2026-10-31: the released checkpoint has
-no MTP layers. model.safetensors.index.json has no mtp or nextn tensors,
-models/hf/config.json has no next-token-prediction field, and
-models/hf/modeling_spark.py has no MTP path. The DSpark draft is the vendor's
-trained multi-token module, shipped separately: its GGUF has no
-token_embd.weight and no output.weight, only output_norm.weight, so it borrows
-the target's embedding and LM head and consumes hidden states at
-dflash.target_layers (the card lists [2, 10, 18, 25, 33]). That is the
-EAGLE-style pattern, a separate 624 M draft fed by target features, not an
-in-checkpoint MTP head. Anything called "fixing MTP" would mean training a
-new module, not repairing one.
-
-3. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
-   also lose both fast kernels, so expect the per-index rates.
-4. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
+   four transposes per layer, the norms and 512 embedding row dequeues.
+   Candidate work, in the order the numbers suggest: batch the embedding row
+   dequeue into one launch; fuse the transpose into the norm and gelu kernels;
+   and revisit the B-tile load's 4-way bank conflict. Acceptance: raise the
+   512-token prompt rate without changing the logits beyond the f16 gate.
+3. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
    first (three words, the shape v3_rounds uses); the tile table would then
    carry it. Per-layer profiles are possible but pointless while matrices
-   share a geometry: the sweep already shows the winner depends on the shape,
-   not the layer. A load-time autotune inside the runtime is the alternative to
-   the profile file, and it would pay the sweep on every cold start.
+   share a geometry. A load-time autotune inside the runtime is the alternative
+   to the profile file, and it would pay the sweep on every cold start.
+4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
+   also lose both fast kernels, so expect the per-index rates.
+
+Why "add MTP" is still not an option, checked 2026-10-31: the released
+checkpoint has no MTP layers. model.safetensors.index.json has no mtp or nextn
+tensors, models/hf/config.json has no next-token-prediction field, and
+models/hf/modeling_spark.py has no MTP path. DSpark is the vendor's separate
+624 M draft: no token_embd, no output weight, borrowing the target's embedding
+and LM head and consuming hidden states at dflash.target_layers. That is the
+EAGLE-style pattern, and it is the only multi-token path available here.
 
 ## 5. Resume
 
@@ -282,6 +542,17 @@ new module, not repairing one.
     ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512 --no-prefill --logits /tmp/gpu-tok.f32
+    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf
+    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft --verify
+    ./bin/dspark check out/draft
+    ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349 \
+        --capture-layers 3,11,19,26,34 --capture /tmp/hid.bin
+    ./bin/dspark forward --draft out/draft --hidden /tmp/hid.bin --target models/hf --anchor 390 --pos0 4
+    ./bin/dspark spec --draft out/draft --target models/hf --ids 1046,11862,314,17349,390 --gen 64 --rounds
+    ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 --weights vq --ids 1046,11862,314,17349,390 --gen 64
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 --draft out/draft --out /tmp/gpu-ids.txt
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --ctx 4096 --draft out/draft --gate1
+    ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 4096 --draft out/draft --bench
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
     ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046 --ctx 64 --profile other.profile   # refused (foreign artifact)
@@ -332,6 +603,26 @@ new module, not repairing one.
   bit-identical: 600 tokens as 512+88 and as one 600-token chunk gave relL2 0,
   so a rate difference between chunk sizes is scheduling, not arithmetic.
   --no-prefill runs the token-by-token path and is the gate's reference.
+- The DSpark card's target_layers and the GGUF disagree: the card says
+  [2, 10, 18, 25, 33], the file says [3, 11, 19, 26, 34]. The file is the
+  authority (it is what the fork's loader reads); treat the card as 1-based or
+  stale, and do not build an extractor from the card.
+- The draft borrows the target's token_embd and LM head and has neither of its
+  own; a draft forward that tries to load weights for them will fail. Its
+  weights are BF16 (tensors) and F32 (norms), 1.249 GB, 58 tensors.
+- Manifest shapes are GGUF shapes: ne0 is the fastest-varying dimension. The
+  reference creates fc as {n_embd_inp, n_embd} = {12800, 2560}, so the stored
+  tensor is 12800x2560, not 2560x12800. The first converter assumed the other
+  orientation and check refused it at once, which is the gate working.
+- The weight bytes of the draft are 1,248,919,044. The GGUF file is
+  1,254,293,824 bytes; the earlier 1,249,293,824 in this handoff was neither,
+  it was the file length with a digits transposed. Do not use a file length as
+  a weight total.
+- The converted layout has no alignment padding at all for this file because
+  every tensor before the last is a multiple of 64 bytes and conf_bias (4
+  bytes) is last; weights.bin therefore ends unaligned and that is legal. The
+  padding rule is exercised by a synthetic 12-tensor draft in /tmp, not by the
+  real one.
 - A tuning profile is bound to the artifact fingerprint and the device name.
   A profile from another artifact, another GPU, or a changed container is
   refused with a printed reason and the heuristic runs; --no-tune skips the
