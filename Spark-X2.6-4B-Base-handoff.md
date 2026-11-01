@@ -19,6 +19,7 @@ feature/dspark-vq, forked from master at 24eca9e, with these commits on it:
     97c67bb  feat(dspark): the GPU executor, propose/verify loop and bench
     37f51df  docs(handoff): record the phase C/D commit
     7637e1b  refactor(dspark): name the GPU draft header .h so the graph parses it
+    eb4f6ea  docs(dspark): report the bench run-to-run range
 
 plus the docs commit that carries this handoff. master is 10 commits ahead of
 origin/master and unpushed until that is approved; nothing on the branch is
