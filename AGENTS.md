@@ -639,7 +639,7 @@ Architecture, read from the GGUF metadata (bin/dspark dump):
 
     dflash.block_count                5 blocks, all sliding-window
     dflash.embedding_length           2560
-    dflash.feed_forward_length        10240, gelu (exact erf)
+    dflash.feed_forward_length        10240, gelu (ggml's tanh form)
     dflash.attention.head_count       16 q heads / 4 kv, head_dim 256
     dflash.rope.dimension_count       64 full, 256 swa; theta 5e6 / 1e4
     dflash.attention.sliding_window   512, pattern [true x 5]
@@ -710,22 +710,68 @@ The manifest's tensor line is role, layer (0-based, -1 global), dtype code
 (0 F32, 1 F16, 2 BF16), ne0, ne1, offset, bytes. Shapes are the GGUF shapes:
 ne0 is the fastest-varying dimension, so a weight that turns a 2560-vector into
 4096 values is 2560x4096, and fc is 12800x2560 (five target layers x hidden in,
-hidden out). Two fields go beyond the handoff's first sketch because a check
-needs them: vocab, so the Markov head validates without a target, and the
-conf_bias role, because conf_proj ships a bias in the reference.
+hidden out). Three fields go beyond the handoff's first sketch: vocab, so the
+Markov head validates without a target; mask_token, read from
+tokenizer.ggml.mask_token_id and checked against vocab, because the block's
+noise slots need it and the draft ships no vocabulary; and the conf_bias role,
+because conf_proj ships a bias in the reference.
 
 Status (2026-10-31, branch feature/dspark-vq): the reader, the dump, the
-converter and the checker exist and are committed. The draft forward, the
-feature injection and the propose/verify loop are NOT implemented yet.
-Acceptance on a VQ target is unmeasured and must be measured, because the draft
-was trained on BF16 hidden states and VQ shifts them (manifest relL2 about
-2.8-3.4 per tensor).
+converter, the checker, the CPU draft forward and the full CPU propose/verify
+loop are implemented. The target is driven in-process through the new
+vq-runtime library, so the draft reads the target's tied embedding in place
+and never loads a second copy of it. The target's layer-input hidden rows are
+captured at layers 3, 11, 19, 26 and 34, and a rollback truncates both the KV
+cache and those captures to the committed length after a partial acceptance.
 
-Why it is expected to work with VQ: the draft needs the target's embedding
-rows and LM head, both of which the VQ runtime already computes, and its input
-is target hidden states, which the runtime can expose at layers 3, 11, 19, 26
-and 34. Nothing in the draft requires a weight format the runtime cannot
-produce. The open risk is acceptance, not plumbing.
+Run one block from a capture (the first-block gate):
+
+    ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349 \
+        --capture-layers 3,11,19,26,34 --capture /tmp/hid.bin
+    ./bin/dspark forward --draft out/draft --hidden /tmp/hid.bin \
+        --target models/hf --anchor 390 --pos0 4
+
+Run the full propose/verify loop (the 64-token gate):
+
+    ./bin/dspark spec --draft out/draft --target models/hf \
+        --ids 1046,11862,314,17349,390 --gen 64 --rounds --out /tmp/ids.txt
+    ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 \
+        --weights vq --ids 1046,11862,314,17349,390 --gen 64
+
+The prompt ids are "The capital of France is" from llama.cpp /tokenize with
+add_special false; the reference holds the last prompt token (390) back as the
+first anchor, which is what both commands above do.
+
+Measured gates, 2026-10-31:
+
+- First block, BF16 and VQ captures: proposals [220 30 35 29 27 198 198],
+  exactly the ids the instrumented reference fork logs for the same state
+  (llama-speculative-simple, --spec-type draft-dspark, --spec-draft-n-max 7,
+  temp 0, top-k 0). Per-row logits differ slightly between CPU f32 and the
+  CUDA BF16 reference; every argmax is identical.
+- 64-token greedy, BF16 target: generated ids identical to the reference
+  fork's committed ids, 18 rounds, 126 drafted, 51 accepted (40.476%). 16 of
+  18 full draft blocks are identical. Round 7's second proposal is a near-tie
+  (ours 34:25.559708 against 614:25.553513; the reference 614:25.562506
+  against 34:25.534792) and both are rejected, so the committed ids do not
+  move. Round 18 differs only because the reference clamps the final block to
+  the remaining generation budget while this loop keeps the full block; the
+  first 64 ids still match.
+- 64-token greedy, VQ 4x8192 x2 target: the speculative ids are identical to
+  that VQ target's own greedy continuation (vq-runtime --weights vq --gen 64),
+  11 rounds, 77 drafted, 53 accepted (68.831%). The VQ continuation is not the
+  BF16 one (it loops on "Paris is a capital of France"), which is the
+  quantization's effect on the target, not a chain error: the chain is exact
+  for the target it runs.
+- CPU speed is reference speed, not a product number: the 64-token BF16 chain
+  takes 61.4 s of decode after a 26 s weight load, about 1.1 committed
+  tok/s; the VQ chain takes 38.3 s of decode after a 20 s load. The GPU draft
+  executor is phase C and is not built.
+
+Gate 1 in the handoff (permutation invariance across a batch of several
+blocks) still needs a batched executor: this decoder runs one block, so there
+is no batch composition to permute yet. It moves to the GPU batch work with
+the rest of phase C.
 
 ## 9. Pitfalls that cost time here
 

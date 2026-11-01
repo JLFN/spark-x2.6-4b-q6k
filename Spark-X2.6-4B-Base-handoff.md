@@ -1,17 +1,26 @@
+--- handoff probe (auto) ---
+=== handoff probe (Spark-X2.6-4B-Base) ===
+--- end handoff probe ---
+
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-10-31. Repo: /data/Spark-X2.6-4B-Base. The active branch is
+Date: 2026-11-01. Repo: /data/Spark-X2.6-4B-Base. The active branch is
 feature/dspark-vq, forked from master at 24eca9e, with these commits on it:
 
     8134077  feat(dspark): a GGUF reader and the draft architecture dump
     33f0599  docs(handoff): the DSpark draft starts
     680fc41  docs(handoff): the generic draft plan
     8ec385e  docs(handoff): refresh the position for compaction
+    168ee3d  feat(dspark): convert a draft to a role manifest and check it
+    13ea07f  feat(vq-runtime): a library target with capture, rollback and
+             embedding access
+    ae2989c  feat(dspark): the CPU draft forward and the propose/verify loop
 
-plus the commit that carries this handoff, feat(dspark): convert a draft to a
-role manifest and check it. master is 10 commits ahead of origin/master and
-unpushed until that is approved; nothing on the branch is pushed either. The
-working tree is clean once that commit exists.
+plus the docs commit that carries this handoff. master is 10 commits ahead of
+origin/master and unpushed until that is approved; nothing on the branch is
+pushed either. The QA gate for this unit was explicitly waived by the user on
+2026-11-01 ("No QA"); the waiver is recorded here and in the project memory,
+and no push has happened.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -56,12 +65,18 @@ result. Where a number is missing it says so.
   917.8 tok/s (section 2).
 - DSpark draft: models/dspark/Spark-X2.6-4B-DSpark.gguf is read by the new
   bin/dspark dump (tools/dspark), and its architecture is recorded in AGENTS.md
-  section 8d: 5 SWA blocks, 2560 hidden, 16/4 heads x 256, gelu, block size 7,
-  target layers [3, 11, 19, 26, 34], and a Markov head over the block.
-  Phase A is done: bin/dspark convert writes out/draft (weights.bin plus the
-  role manifest) and bin/dspark check validates it, measured in section 2. The
-  draft forward, the feature injection and the propose/verify loop are NOT
-  implemented; they are phases B-D below.
+  section 8d: 5 SWA blocks, 2560 hidden, 16/4 heads x 256, ggml's tanh gelu,
+  block size 7, target layers [3, 11, 19, 26, 34], and a Markov head over the
+  block. Phase A is done: bin/dspark convert writes out/draft (weights.bin plus
+  the role manifest) and bin/dspark check validates it, measured in section 2.
+  Phase B is done too: vq-runtime is now a library, the target captures its
+  layer-input rows and rolls both caches back after a partial acceptance, and
+  bin/dspark forward / bin/dspark spec run the draft block and the full CPU
+  propose/verify loop. On the 64-token greedy gate the generated ids are
+  identical to the instrumented reference fork (BF16 target) and identical to
+  the VQ target's own greedy continuation (VQ 4x8192 x2 target), with
+  acceptance 40.476% and 68.831% respectively (section 2). Phase C, the GPU
+  draft executor, is not started.
 
 ## 2. Measurements (do not re-derive)
 
@@ -229,6 +244,32 @@ Break-even sits near 0.3, and this draft measured 0.20-0.32 on the Q6_K and
 Q4_K_M targets. A quantized draft would cut the 1.25 GB read and push
 break-even down. None of this is a result until phase D runs.
 
+Draft phase B gate, MEASURED 2026-10-31 on the CPU chain (tools/dspark spec),
+prompt [1046, 11862, 314, 17349, 390], greedy, block size 7:
+
+    BF16 target (models/hf), 64 generated ids
+        ids identical to the reference fork's committed ids (instrumented
+        llama-speculative-simple, --spec-type draft-dspark, -n 64, temp 0)
+        18 rounds, 126 drafted, 51 accepted, acceptance 40.476%
+        16 of 18 full draft blocks identical; round 7 row 1 is a near-tie
+        (ours 34:25.559708 / 614:25.553513, reference 614:25.562506 /
+        34:25.534792), both rejected, so the committed ids do not move;
+        round 18 differs only because the reference clamps its last block to
+        the remaining budget
+        decode 61.4 s after a 25.9 s weight load, 1.12 committed tok/s
+    VQ 4x8192 x2 target (models/vq-build-8192-2-v3), 64 generated ids
+        ids identical to that target's own greedy continuation
+        (vq-runtime --weights vq --gen 64)
+        11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
+        decode 38.3 s after a 20 s weight load, 1.67 committed tok/s
+        the VQ continuation differs from the BF16 one (it loops on
+        "Paris is a capital of France"); the chain is exact for its target,
+        the target is the quantized one
+
+The first-block gate also matches on both captures: proposals
+[220 30 35 29 27 198 198], exactly the reference's logged ids. Per-row logits
+differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
+
 ## 3. Decisions and why
 
 - DQV3 is the payload to build. Same container size, same quality, and it is
@@ -349,28 +390,46 @@ break-even down. None of this is a result until phase D runs.
    bytes; the converter's own sum and a hand sum of the 58 tensor sizes agree
    on 1,248,919,044.
 
-   Phase B, CPU draft forward (Rust), gated in two steps.
+   Phase B, CPU draft forward and the propose/verify loop (Rust). DONE
+   2026-10-31.
 
-   - Feature encoder: per-target-layer RMS norm with fc_norm, concatenate in
-     target_layers order, fc, enc_norm, then the per-layer K/V for the draft
-     cache.
-   - Block encoder: target embedding rows, the declared number of blocks, SWA
-     (window and block, non-causal per the manifest's causal flag), the per-head
-     sigmoid gate when attn_gate exists and the q/k norms when they exist
-     instead, the declared activation, and the target LM head.
-   - Markov and confidence heads only when their roles exist; the chain is
-     argmax over biased logits, starting from the anchor token
-     (sample_from_anchor decides whether position 0 is a draft slot).
-   - Gate 1, no reference needed: the block is non-causal, so the same seven
-     tokens must produce the same seven proposals regardless of batch
-     composition and of other blocks in the batch (permutation invariance).
-   - Gate 2, reference: run the fork with --spec-type draft-dspark on a fixed
-     prompt, compare the generated ids and the accepted/drafted counts, and
-     record acceptance. If the proposals themselves are not logged, instrument
-     only a gate build of the fork; the shipped path is never patched.
-   - Acceptance for phase B: identical generated ids to the fork over a 64-token
-     greedy continuation, and an acceptance rate inside the fork's logged range
-     on the same prompt.
+       vq-runtime --weights hf --dir models/hf --ids IDS \
+           --capture-layers 3,11,19,26,34 --capture FILE
+       dspark forward --draft OUTDIR --hidden FILE --target DIR --anchor ID \
+           [--pos0 N] [--n-draft K]
+       dspark spec --draft OUTDIR --target DIR --ids LIST --gen N \
+           [--weights hf|vq] [--n-max K] [--rounds] [--trace-logits]
+
+   tools/vq-runtime is a library plus a thin binary now. The model, config,
+   safetensors and VQ-source modules are public, Model::forward appends the
+   layer-input row to a capture slot at the start of every requested layer,
+   Model::embed_row exposes the tied embedding, and Model::rollback truncates
+   the KV cache and the captures to the committed length. The draft decoder
+   takes a TargetEmbed trait, implemented by the target Model and by the
+   standalone safetensors Embedding, so the loop reads the target's embedding
+   in place instead of loading a second 131072 x 2560 copy.
+
+   The loop is the reference's, not an approximation of it:
+   the target holds pos0 committed positions and an unprocessed anchor at
+   pos0; the draft block runs at pos0..pos0+n_draft-1, anchor first; the
+   target verifies [anchor, p0, ..., p_{n-1}] at pos0..pos0+n_draft, row
+   pos0+i predicting proposal i; the first mismatch k commits p0..p_{k-1}
+   and the target's own token at row pos0+k; the target keeps rows 0..k and
+   the next anchor is the target token at pos0+k+1. The draft's injected
+   features are the target layer inputs of the committed rows, so the same
+   rollback truncates both caches. The manifest's mask_token (2, from
+   tokenizer.ggml.mask_token_id) fills the noise slots.
+
+   Gate 1 (permutation invariance across a batch of blocks) is deferred: the
+   CPU decoder runs one block, so there is no batch composition to permute.
+   It moves to the batched GPU executor in phase C.
+
+   Gate 2 (reference fork, 64-token greedy) is met, measured in section 2:
+   identical generated ids and identical acceptance on the BF16 target, and
+   identical ids to the VQ target's own greedy continuation on the VQ target.
+   Acceptance is 40.476% on BF16, above the 0.20-0.32 the Q6_K and Q4_K_M
+   targets measured, and 68.831% on VQ 4x8192 x2, well above the ~0.3
+   break-even the economics estimate names.
 
    Phase C, GPU executor and integration (CUDA).
 
@@ -444,9 +503,14 @@ EAGLE-style pattern, and it is the only multi-token path available here.
     ./bin/vq-runtime --weights vq --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --logits /tmp/vq.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 64 --ctx 512 --logits /tmp/gpu.f32
     ./bin/vq-model-gpu --dir models/vq-build-8192-2-v3 --ids 1046,11862,314,17349,390 --gen 8 --ctx 512 --no-prefill --logits /tmp/gpu-tok.f32
-    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf   # exists
-    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft --verify   # exists
-    ./bin/dspark check out/draft                                            # exists
+    ./bin/dspark dump models/dspark/Spark-X2.6-4B-DSpark.gguf
+    ./bin/dspark convert models/dspark/Spark-X2.6-4B-DSpark.gguf out/draft --verify
+    ./bin/dspark check out/draft
+    ./bin/vq-runtime --weights hf --dir models/hf --ids 1046,11862,314,17349 \
+        --capture-layers 3,11,19,26,34 --capture /tmp/hid.bin
+    ./bin/dspark forward --draft out/draft --hidden /tmp/hid.bin --target models/hf --anchor 390 --pos0 4
+    ./bin/dspark spec --draft out/draft --target models/hf --ids 1046,11862,314,17349,390 --gen 64 --rounds
+    ./bin/dspark spec --draft out/draft --target models/vq-build-8192-2-v3 --weights vq --ids 1046,11862,314,17349,390 --gen 64
     ./bin/dspark bench --target models/vq-build-8192-2-v3 --draft out/draft --gen 64   # planned (phase D)
     ./bin/vq-tune models/vq-build-8192-2-v3 --tokens 512 --iters 7 [--dry-run] [--force]   # writes vq-tune.profile
     ./bin/vq-tune models/vq-build-8192-2 --tokens 512 --iters 5                 # DQVQ: legacy prefill only
