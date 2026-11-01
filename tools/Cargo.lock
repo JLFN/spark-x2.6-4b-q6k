@@ -37,6 +37,11 @@ dependencies = [
 [[package]]
 name = "dspark"
 version = "0.1.0"
+dependencies = [
+ "rayon",
+ "serde_json",
+ "vq-runtime",
+]
 
 [[package]]
 name = "either"

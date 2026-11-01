@@ -395,6 +395,16 @@ fn header_from_gguf(g: &Gguf) -> Result<Header, String> {
         ));
     }
     let vocab = req_u64(g, &k("vocab_size"))?;
+    // The decoder fills the noise slots with the draft's BLANK token, so the
+    // tokenizer's mask id is a runtime requirement, not a detail.
+    let mask_token = g.get_u64("tokenizer.ggml.mask_token_id").ok_or_else(|| {
+        "tokenizer.ggml.mask_token_id is missing; DFlash block diffusion needs the draft's BLANK token".to_string()
+    })?;
+    if mask_token >= vocab {
+        return Err(format!(
+            "mask token {mask_token} is outside the {vocab}-id vocabulary"
+        ));
+    }
     let rope_full_dims = req_u64(g, &k("rope.dimension_count"))?;
     let rope_swa_dims = req_u64(g, &k("rope.dimension_count_swa"))?;
     let rope_full_theta = num(g, &k("rope.freq_base"))?;
@@ -455,6 +465,7 @@ fn header_from_gguf(g: &Gguf) -> Result<Header, String> {
         kv_heads,
         head_dim,
         vocab,
+        mask_token,
         rope_full_dims,
         rope_swa_dims,
         rope_full_theta: rope_full_theta as f32,

@@ -90,6 +90,11 @@ pub struct Header {
     pub kv_heads: u32,
     pub head_dim: u64,
     pub vocab: u64,
+    /// The draft's BLANK token id: the block-diffusion decoder substitutes it
+    /// for the noise slots (common/speculative.cpp:1377, mask_token_id =
+    /// llama_vocab_mask(model_dft)). A draft without this special token cannot
+    /// run block diffusion, so conversion refuses a miss rather than guessing.
+    pub mask_token: u64,
     pub rope_full_dims: u64,
     pub rope_swa_dims: u64,
     pub rope_full_theta: f32,
@@ -156,6 +161,12 @@ impl Header {
         }
         if self.vocab == 0 {
             return Err("vocab must be non-zero".into());
+        }
+        if self.mask_token >= self.vocab {
+            return Err(format!(
+                "mask_token {} is outside the {}-id vocabulary",
+                self.mask_token, self.vocab
+            ));
         }
         for (name, d) in [
             ("rope_full_dims", self.rope_full_dims),
@@ -423,6 +434,7 @@ impl Manifest {
         s.push_str(&format!("kv_heads {}\n", h.kv_heads));
         s.push_str(&format!("head_dim {}\n", h.head_dim));
         s.push_str(&format!("vocab {}\n", h.vocab));
+        s.push_str(&format!("mask_token {}\n", h.mask_token));
         s.push_str(&format!("rope_full_dims {}\n", h.rope_full_dims));
         s.push_str(&format!("rope_swa_dims {}\n", h.rope_swa_dims));
         s.push_str(&format!("rope_full_theta {}\n", h.rope_full_theta));
@@ -584,6 +596,7 @@ impl Manifest {
         let kv_heads = u32_val("kv_heads")?;
         let head_dim = num_val("head_dim")?;
         let vocab = num_val("vocab")?;
+        let mask_token = num_val("mask_token")?;
         let rope_full_dims = num_val("rope_full_dims")?;
         let rope_swa_dims = num_val("rope_swa_dims")?;
         let rope_full_theta = float_val("rope_full_theta")?;
@@ -619,6 +632,7 @@ impl Manifest {
             "kv_heads",
             "head_dim",
             "vocab",
+            "mask_token",
             "rope_full_dims",
             "rope_swa_dims",
             "rope_full_theta",
@@ -648,6 +662,7 @@ impl Manifest {
                 kv_heads,
                 head_dim,
                 vocab,
+                mask_token,
                 rope_full_dims,
                 rope_swa_dims,
                 rope_full_theta,
