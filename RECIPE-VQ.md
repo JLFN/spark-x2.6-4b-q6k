@@ -1,9 +1,16 @@
 # Recipe: a VQ build of Spark-X2.6-4B
 
-Status: encoder in-repo and working; no runnable VQ Spark yet. The measurements
-below are the reason the next step is a decision, not a build order. AGENTS.md
-section 5 carries the fuller sweep, the whole-checkpoint builds and the
-whole-model k-quant comparison measured after this file was written.
+Status: encoder in-repo and working; two runtimes load and run the artifacts.
+The CPU f32 reference is gated against the bf16 checkpoint and against
+llama.cpp, and the GPU model runtime is gated against that reference; it
+decodes at 71 tok/s on 4x8192 x2, 24x the reference, and ingests a prompt at
+about 850-918 tok/s on the tiled prefill (section 8, item 2, and AGENTS.md
+sections 8b and 8c). bin/vq-tune now measures the kernel shapes per artifact
+and the runtime consumes the profile. The measurements below are the reason the next step is
+a decision, not a build order, and the runtime did not change the verdict on
+quality. AGENTS.md section 5 carries the fuller sweep, the whole-checkpoint
+builds and the whole-model k-quant comparison measured after this file was
+written.
 
 ## 1. Verdict first
 
@@ -35,8 +42,10 @@ does reach Q5_K-class quality, but it needs about 0.5 bpw more than Q5_K to get
 there. At Q5_K's own 5.50 bpw, two VQ stages sit at 4.88%, a third worse.
 
 At equal memory, Q6_K still wins outright: 6.56 bpw for 1.79%, against 6.02 bpw
-for 3.93%. VQ is therefore dominated on this model at every budget, which is the
-reason the runtime port is not worth starting.
+for 3.93%. VQ is therefore dominated on this model at every budget, which is
+why the runtime port was not started on that evidence. It was started later, on
+the operator's instruction, as a reference implementation (section 8, item 2);
+it does not change this table.
 
 So a VQ Spark lands in Q3_K class at about 3.5 bpw, roughly a 1.8-2.1 GB artifact
 against the 3.46 GB Q6_K, and that estimate is unmeasured. The EmbeddingGemma VQ
@@ -292,7 +301,32 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    /data/embeddinggemma2/RECIPE.md section 4d); the GGUF wrapping must name a
    family the runtime knows.
 
-2. A runtime that decodes VQ. This is the real gap.
+2. A runtime that decodes VQ. A CPU f32 reference now exists
+   (tools/vq-runtime): it loads the bf16 checkpoint or an RQVQ artifact, runs
+   the full Spark2_5 forward pass over token ids, and writes the logits so a
+   second binary (bin/logits-diff) can price the quantization. Gated
+   2026-10-31 on the prompt "The capital of France is": against llama.cpp's
+   bf16 GGUF the top 20 next tokens are the same ids in the same order with
+   log-softmax within 0.011, so the forward pass itself is verified; against
+   bf16, 4x8192 x2 keeps the argmax with logit relL2 11.52% and KL 0.42 nats,
+   and 4x4096 x3 is closer at 9.51% and 0.38. It is a reference, not a speed
+   path: 16.45 GB of f32 weights per token, 2.7-2.9 tok/s, 16.1 GB resident.
+   A second runtime, tools/vq/gpu/vq-model-gpu.cu, runs the whole forward
+   pass on the GPU over the same artifact and is gated against the reference:
+   at the same prompt the logits agree to relL2 0.000027% (maxabs 1.9e-5,
+   top-100 100/100) and the 8 generated ids are identical; over a 600-token
+   prompt, which exercises the sliding window past position 512, relL2 is
+   0.000863% with the same argmax. It decodes at 70.8-71.8 tok/s (13.9-14.1
+   ms/token) at ctx 512 on 4x8192 x2, 24x the CPU reference and about 74
+   percent of the artifact-only block-kernel rate measured in the same session
+   (10.32 ms/token). The prompt path is wired to the tiled f16 prefill:
+   against the token-by-token path the logits agree to relL2 0.0055% at 5
+   tokens (0.15% over 600 tokens, KL 1e-6, top-25 25/25), the generated ids
+   are identical, and prompt ingestion is 851-868 tok/s at 128-512 tokens
+   (14x the token path). The residual error is the f16 activation conversion
+   in the mma kernel; the token path itself is three orders of magnitude
+   closer to the CPU reference. A 600-token prompt split across two chunks is
+   bit-identical to one chunk. The speed gap against llama.cpp is unchanged:
    - llama.cpp, which runs Spark today, has no codebook type at all: its ftypes
      are F16, Q4_0, Q4_1, Q8_0, Q5_0, Q5_1, Q2_K..Q6_K (include/llama.h:120).
      A VQ Spark on llama.cpp means a new ggml type plus a CUDA GEMV/GEMM path for
@@ -300,6 +334,25 @@ Caveat on the buffer term: 1,300 MiB is measured at 32K and 128K, where it range
    - ds4-rs decodes DQVQ, but it has no Spark family: searching its crates for
      spark2_5 returns nothing, and the gemma_vq path is an embedding-only tower.
      This route means a full Spark2_5 family port into ds4.
+   What the reference runtime did settle: the container, the decoder and a
+   correct forward pass are no longer open questions. The block GEMV and the
+   tiled prefill are both wired into the GPU model runtime now (299 GB/s and
+   71 tok/s decode end to end; 851-918 tok/s prompt ingestion); the remaining
+   speed work is closing the gap between the model-level prompt rate and the
+   artifact-only 1743-1909 tok/s, which is attention and layout overhead rather
+   than matrix work.
+   The kernel shapes are measured per artifact, not assumed: bin/vq-tune
+   (AGENTS.md section 8c) sweeps the legal GEMV variants, launch widths and
+   prefill tiles on the real containers, rejects anything outside relL2 1e-4
+   of the default, and writes <artifact>/vq-tune.profile, which the runtime
+   reads only when the artifact fingerprint and the device match. On 4x8192 x2
+   the profile is bit-identical to the heuristic (relL2 0.000000%, top-100
+   100/100) and moves a 500-token prompt from 892.3 to 917.8 tok/s; the tiles
+   it picks differ per geometry (128x64 for gate/up, 64x64 for down and qkv,
+   256x64 for the embedding), which is exactly why one build constant was the
+   wrong shape for the job. A DQVQ artifact sweeps too, but has no tiled
+   prefill path, so its profile records legacy prefill and the runtime keeps
+   the token-by-token prompt.
 
 3. MTP / DSpark on top. The draft model reads target hidden states at layers
    2, 10, 18, 25 and 33. Weight format does not matter to the draft; what matters

@@ -1,0 +1,19 @@
+[package]
+name = "vq-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reference inference runtime for Spark2_5 weights, from the bf16 checkpoint or from RQVQ VQ containers"
+
+[[bin]]
+name = "vq-runtime"
+path = "src/main.rs"
+
+[[bin]]
+name = "logits-diff"
+path = "src/bin/logits-diff.rs"
+
+[dependencies]
+vq-format = { path = "../vq-format" }
+serde_json = "1"
+rayon = "1"

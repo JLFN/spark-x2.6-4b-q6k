@@ -1,0 +1,10 @@
+[package]
+name = "vq-format"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reader for RQVQ VQ containers (DQVQ and DQV3 payloads) and their RQVF raw f32 sidecars"
+
+[lib]
+name = "vq_format"
+path = "src/lib.rs"

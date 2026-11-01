@@ -53,7 +53,11 @@ fi
 "$CARGO" build --release --manifest-path "$ROOT/tools/Cargo.toml"
 cp "$ROOT/tools/target/release/dqvq" "$ROOT/bin/dqvq"
 cp "$ROOT/tools/target/release/vq-bench" "$ROOT/bin/vq-bench"
-echo "built $ROOT/bin/dqvq and $ROOT/bin/vq-bench"
+cp "$ROOT/tools/target/release/vq-runtime" "$ROOT/bin/vq-runtime"
+cp "$ROOT/tools/target/release/logits-diff" "$ROOT/bin/logits-diff"
+cp "$ROOT/tools/target/release/vq-tune" "$ROOT/bin/vq-tune"
+cp "$ROOT/tools/target/release/dspark" "$ROOT/bin/dspark"
+echo "built $ROOT/bin/dqvq, $ROOT/bin/vq-bench, $ROOT/bin/vq-runtime, $ROOT/bin/logits-diff, $ROOT/bin/vq-tune and $ROOT/bin/dspark"
 
 # Needs both the safetensors reader and the k-quant encoders, nothing else.
 $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
@@ -61,7 +65,16 @@ $CC $CFLAGS $VQ_INC $KQ_INC -o "$ROOT/bin/quant_err" \
 echo "built $ROOT/bin/quant_err"
 
 # GPU path: device-resident Lloyd and assignment. Needs nvcc.
-NVCC=${NVCC:-/usr/local/cuda-13.3/bin/nvcc}
+# Resolve the toolkit without pinning a version: an explicit NVCC wins, then
+# PATH, then the unversioned /usr/local/cuda symlink. A hardcoded
+# /usr/local/cuda-13.3 breaks the build the day the toolkit is upgraded.
+if [ -z "${NVCC:-}" ]; then
+  if command -v nvcc >/dev/null 2>&1; then
+    NVCC=$(command -v nvcc)
+  else
+    NVCC=/usr/local/cuda/bin/nvcc
+  fi
+fi
 ARCH=${ARCH:-89}
 if [ -x "$NVCC" ]; then
   $NVCC -O3 -std=c++17 -arch=sm_$ARCH -c -o "$OBJ/vq_gpu.o" "$ROOT/tools/vq/gpu/vq_gpu.cu"
@@ -76,6 +89,15 @@ if [ -x "$NVCC" ]; then
     "$ROOT/tools/vq/gpu/decode-gpu.c" "$OBJ/decode_gpu.o" -lm -lstdc++ -L/usr/local/cuda/lib64 -lcudart \
     -Wl,-rpath,/usr/local/cuda/lib64
   echo "built $ROOT/bin/decode-gpu"
+
+  # Whole-model GPU runtime: the same object's fused GEMV, plus the model's
+  # norms, rope, attention, gate and MLP kernels.
+  # cuBLAS is the draft's f32 GEMM path: the draft weights are BF16 in the
+  # manifest and are loaded as f32 so the GPU follows the CPU gate. The target
+  # itself stays on the repository's own VQ kernels.
+  $NVCC -O3 -std=c++17 -arch=sm_$ARCH -o "$ROOT/bin/vq-model-gpu" \
+    "$ROOT/tools/vq/gpu/vq-model-gpu.cu" "$OBJ/decode_gpu.o" -lm -lcublas
+  echo "built $ROOT/bin/vq-model-gpu"
 else
   echo "skipped build-vq-gpu and decode-gpu: $NVCC not found"
 fi

@@ -8,3 +8,6 @@ description = "Reference decoder and fused GEMV for RQVQ VQ containers"
 [[bin]]
 name = "dqvq"
 path = "src/main.rs"
+
+[dependencies]
+vq-format = { path = "../vq-format" }

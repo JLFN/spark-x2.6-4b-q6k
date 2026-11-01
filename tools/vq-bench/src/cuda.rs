@@ -99,9 +99,18 @@ pub struct DevBuf {
 }
 
 impl DevBuf {
+    /// Every buffer carries 8 bytes past `bytes`, zeroed: the kernels read
+    /// aligned 4- and 8-byte index windows, and the last index of the last row
+    /// can reach up to 7 bytes past a stage's payload (see rd_idx_fmt in
+    /// tools/vq/gpu/decode-gpu.cu). `bytes` stays the caller's size, so the
+    /// fit checks and byte accounting do not change.
     pub fn alloc(bytes: usize) -> Result<DevBuf, String> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        check(unsafe { cudaMalloc(&mut ptr, bytes) }, "cudaMalloc")?;
+        check(unsafe { cudaMalloc(&mut ptr, bytes + 8) }, "cudaMalloc")?;
+        check(
+            unsafe { cudaMemset((ptr as *mut u8).add(bytes) as *mut c_void, 0, 8) },
+            "cudaMemset slack",
+        )?;
         Ok(DevBuf { ptr, bytes })
     }
 
