@@ -4,28 +4,19 @@
 
 # Spark-X2.6-4B-Base — session handoff
 
-Date: 2026-11-01. Repo: /data/Spark-X2.6-4B-Base. The active branch is
-feature/dspark-vq, forked from master at 24eca9e, with these commits on it:
+Date: 2026-11-01. Repo: /data/Spark-X2.6-4B-Base. The active branch is dev.
+The DSpark work lived on feature/dspark-vq (14 commits off master at
+24eca9e) and is merged and pushed:
 
-    8134077  feat(dspark): a GGUF reader and the draft architecture dump
-    33f0599  docs(handoff): the DSpark draft starts
-    680fc41  docs(handoff): the generic draft plan
-    8ec385e  docs(handoff): refresh the position for compaction
-    168ee3d  feat(dspark): convert a draft to a role manifest and check it
-    13ea07f  feat(vq-runtime): a library target with capture, rollback and
-             embedding access
-    ae2989c  feat(dspark): the CPU draft forward and the propose/verify loop
-    9a075ed  docs(dspark): record the phase B gate and the draft commands
-    97c67bb  feat(dspark): the GPU executor, propose/verify loop and bench
-    37f51df  docs(handoff): record the phase C/D commit
-    7637e1b  refactor(dspark): name the GPU draft header .h so the graph parses it
-    eb4f6ea  docs(dspark): report the bench run-to-run range
+    PR #1  feature/dspark-vq -> dev     merge commit 02fe1ad
+    PR #2  dev -> master                merge commit 4001b15
 
-plus the docs commit that carries this handoff. master is 10 commits ahead of
-origin/master and unpushed until that is approved; nothing on the branch is
-pushed either. The QA gate for this unit was explicitly waived by the user on
-2026-11-01 ("No QA"); the waiver is recorded here and in the project memory,
-and no push has happened.
+The work branch was deleted after the merge; origin has only dev and master,
+and local master, dev and origin/dev all carry the work. The QA gate for the
+DSpark unit was explicitly waived by the user on 2026-11-01 ("No QA"); the OSV
+scan of tools/Cargo.lock found 23 packages and 0 advisories. The next unit,
+Phase E, starts on a new feature branch cut from dev and lands through its own
+PR; it does not ride the DSpark branch.
 
 Everything below was run in this repository; nothing is a plan dressed as a
 result. Where a number is missing it says so.
@@ -342,11 +333,12 @@ stay in the per-round row buffer.
 
 ## 4. Open work, in priority order
 
-1. Generic draft (speculative decoding) support. ACTIVE, branch
-   feature/dspark-vq. The deliverable is a tool path, not a second runtime
-   hardcoded to one checkpoint: any dflash-style draft GGUF is converted once
-   into a role manifest, and the executor takes every dimension, activation,
-   rope parameter and optional head from that manifest. The target side is
+1. Generic draft (speculative decoding) support. DONE and merged (PR #1,
+   02fe1ad; promoted to master in 4001b15). The deliverable is a tool path,
+   not a second runtime hardcoded to one checkpoint: any dflash-style draft
+   GGUF is converted once into a role manifest, and the executor takes every
+   dimension, activation, rope parameter and optional head from that manifest.
+   The target side is
    reached through one small interface (embedding rows, LM head, hidden states
    at the draft's declared target_layers), so the same draft code can serve the
    VQ runtime or the CPU reference. The only per-family text in the code is the
@@ -502,7 +494,49 @@ stay in the per-round row buffer.
    target. The earlier ~0.3 estimate was optimistic because the draft block
    costs 13.9-14.2 ms, not the 4-6 ms assumed in section 2.
 
-2. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
+2. Model-agnostic architecture detection (Phase E). NOT STARTED. New feature
+   branch off dev, landed through its own PR; it is not part of the DSpark
+   work. Today vq-runtime and vq-model-gpu know Spark2_5 by construction: the
+   geometry, the tensor roles and the forward pass are written for one
+   checkpoint. Phase E is the descriptor layer that lets both runtimes load a
+   model by role instead of by name, so the next architecture is a config
+   parse plus a role mapping, not a code change.
+
+   - Input: the HF side (config.json plus model.safetensors.index.json) or
+     the GGUF side (tensor table plus metadata). Output: MODEL.json with the
+     per-layer attention family (full or sliding window), heads, KV heads,
+     head_dim, rope dims and theta per family, FFN width and activation, the
+     norms, and the global tensors. Shapes are read from the file, never from
+     a table in the source.
+   - Two verdicts, reported separately: VQ-convertible (every weight the VQ
+     payload carries has a known role and a supported shape) and runnable
+     (the runtime implements every operation the descriptor names). A model
+     can be VQ-convertible and not runnable.
+   - 3-D expert stacks (MoE) are detected and either mapped to a role or
+     refused by name; a 3-D tensor is never treated as a 2-D one.
+   - Unsupported features are refused by name (a vision tower, an unknown
+     rope variant, a per-layer scalar this build does not apply), never
+     skipped silently.
+   - vq-runtime and vq-model-gpu take the descriptor and dispatch by role.
+
+   Stress fixture, checked against the published config on 2026-11-01:
+   google/gemma-4-26B-A4B-it, architectures Gemma4ForConditionalGeneration,
+   text_config with 30 layers, 16 heads, 8 local KV heads and 2 global KV
+   heads, head_dim 256 local and global_head_dim 512, sliding_window 1024,
+   MoE 128 experts top-8 (moe_intermediate_size 704, intermediate_size 2112),
+   attention_k_eq_v true (no v_proj on the five full-attention layers),
+   proportional p-RoPE with partial_rotary_factor 0.25 on full attention,
+   final_logit_softcapping 30, and a 27-layer vision tower. The tensor table
+   adds layer_scalar and the extra FFN norms. The fixture proves detection
+   and the two verdicts; running that model is out of scope and must be
+   refused by name.
+
+   Acceptance: the Spark checkpoint yields a MODEL.json that reproduces the
+   current hardcoded geometry field for field, the existing gates stay green,
+   and the Gemma 4 descriptor is produced with the full layer inventory and a
+   named refusal for execution.
+
+3. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
    and gated (section 2), and the tile shapes are now measured per geometry
    (851-918 tok/s at 500-512 tokens against 1743-1909 tok/s for artifact-only
    matrix work), so roughly half the prompt time is the batched attention,
@@ -511,12 +545,12 @@ stay in the per-round row buffer.
    dequeue into one launch; fuse the transpose into the norm and gelu kernels;
    and revisit the B-tile load's 4-way bank conflict. Acceptance: raise the
    512-token prompt rate without changing the logits beyond the f16 gate.
-3. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
+4. Tuner extensions, none started. A BK 128 tile needs a 96-bit A-tile window
    first (three words, the shape v3_rounds uses); the tile table would then
    carry it. Per-layer profiles are possible but pointless while matrices
    share a geometry. A load-time autotune inside the runtime is the alternative
    to the profile file, and it would pay the sweep on every cold start.
-4. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
+5. A 4x16384 point would need the DQVQ payload and is unmeasured; it would
    also lose both fast kernels, so expect the per-index rates.
 
 Why "add MTP" is still not an option, checked 2026-10-31: the released
