@@ -12,16 +12,12 @@
 //! --logits FILE writes the f32 logits of the last prompt position, for the
 //! gate against llama-server's /completion probabilities.
 
-mod config;
-mod model;
-mod safetensors;
-mod vq_source;
-
-use model::{Model, Weights};
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
+use vq_runtime::config;
+use vq_runtime::model::{Model, Weights};
 
 const USAGE: &str = "\
 usage: vq-runtime --weights hf|vq --dir DIR [options]
@@ -32,6 +28,11 @@ usage: vq-runtime --weights hf|vq --dir DIR [options]
   --threads N       rayon threads (default all cores)
   --top N           print the N best next tokens (default 5)
   --logits FILE     write the last prompt position's f32 logits
+  --capture-layers LIST   capture the layer-input hidden rows at these
+                    comma-separated 0-based layer ids (draft feature source)
+  --capture FILE    write the captures as SPHID 1, layer-major f32
+  --embed-ids LIST  token ids whose target embedding rows are needed
+  --embed FILE      write them as SROW 1, row-major f32
   --weights hf|vq   bf16 safetensors checkpoint or RQVQ artifact
 ";
 
@@ -46,6 +47,10 @@ fn run() -> Result<(), String> {
     let mut threads = 0usize;
     let mut topn = 5usize;
     let mut logits_out: Option<String> = None;
+    let mut capture_layers: Vec<u32> = Vec::new();
+    let mut capture_out: Option<String> = None;
+    let mut embed_ids: Vec<u32> = Vec::new();
+    let mut embed_out: Option<String> = None;
 
     let mut i = 1;
     while i < a.len() {
@@ -91,6 +96,36 @@ fn run() -> Result<(), String> {
                 logits_out = Some(take(i)?);
                 i += 2;
             }
+            "--capture-layers" => {
+                capture_layers = take(i)?
+                    .split(|c: char| c == ',' || c == ' ')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<u32>()
+                            .map_err(|e| format!("bad capture layer {s}: {e}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                i += 2;
+            }
+            "--capture" => {
+                capture_out = Some(take(i)?);
+                i += 2;
+            }
+            "--embed-ids" => {
+                embed_ids = take(i)?
+                    .split(|c: char| c == ',' || c == ' ')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<u32>()
+                            .map_err(|e| format!("bad embed token {s}: {e}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                i += 2;
+            }
+            "--embed" => {
+                embed_out = Some(take(i)?);
+                i += 2;
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -108,7 +143,10 @@ fn run() -> Result<(), String> {
     let ids: Vec<u32> = ids_arg
         .split(|c: char| c == ',' || c == ' ' || c == ';')
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad token id {s}: {e}")))
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| format!("bad token id {s}: {e}"))
+        })
         .collect::<Result<_, _>>()?;
     if ids.is_empty() {
         return Err("--ids needs at least one token id".into());
@@ -128,13 +166,16 @@ fn run() -> Result<(), String> {
     );
     println!(
         "rope        full theta {} partial {}, sliding theta {} partial {}",
-        cfg.rope_full.theta, cfg.rope_full.partial, cfg.rope_sliding.theta, cfg.rope_sliding.partial
+        cfg.rope_full.theta,
+        cfg.rope_full.partial,
+        cfg.rope_sliding.theta,
+        cfg.rope_sliding.partial
     );
 
     let t0 = Instant::now();
     let w = match weights.as_str() {
-        "hf" => Weights::from_hf(cfg, Path::new(&dir))?,
-        _ => Weights::from_vq(cfg, Path::new(&dir))?,
+        "hf" => Weights::from_hf(cfg.clone(), Path::new(&dir))?,
+        _ => Weights::from_vq(cfg.clone(), Path::new(&dir))?,
     };
     println!(
         "weights     {} ({:.2} GB f32) in {:.1} s",
@@ -145,6 +186,49 @@ fn run() -> Result<(), String> {
 
     let total = ids.len() + gen + 1;
     let mut m = Model::new(w, ctx.max(total));
+    if !capture_layers.is_empty() {
+        m.enable_capture(&capture_layers, cfg.hidden)?;
+    }
+    if let Some(path) = &embed_out {
+        if embed_ids.is_empty() {
+            return Err("--embed needs --embed-ids".into());
+        }
+        let mut b = Vec::new();
+        b.extend_from_slice(
+            format!(
+                "SROW 1\nhidden {}\nids {}\n",
+                cfg.hidden,
+                embed_ids
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .as_bytes(),
+        );
+        for id in &embed_ids {
+            if *id as usize >= cfg.vocab {
+                return Err(format!("embed token {id} is outside the vocabulary"));
+            }
+            let row = m.w.embed.row(*id as usize);
+            if row.len() != cfg.hidden {
+                return Err(format!(
+                    "embed row {id} is {} wide, expected {}",
+                    row.len(),
+                    cfg.hidden
+                ));
+            }
+            for v in row {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        fs::write(path, &b).map_err(|e| format!("{path}: {e}"))?;
+        println!(
+            "embed      {} rows of {} floats written to {path}",
+            embed_ids.len(),
+            cfg.hidden
+        );
+    }
 
     let mut logits_last = Vec::new();
     let t0 = Instant::now();
@@ -169,6 +253,47 @@ fn run() -> Result<(), String> {
         }
         fs::write(path, &b).map_err(|e| format!("{path}: {e}"))?;
         println!("logits      {} floats written to {path}", logits_last.len());
+    }
+
+    if let Some(path) = &capture_out {
+        // only the prompt positions were captured; generation rows follow later
+        let rows = m.captured(0).len() / cfg.hidden;
+        let mut b = Vec::new();
+        b.extend_from_slice(
+            format!(
+                "SPHID 1\nhidden {}\ntokens {}\nlayers {}\n",
+                cfg.hidden,
+                rows,
+                capture_layers
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .as_bytes(),
+        );
+        for k in 0..capture_layers.len() {
+            let c = m.captured(k);
+            if c.len() != rows * cfg.hidden {
+                return Err(format!(
+                    "capture slot {k} holds {} floats, expected {}",
+                    c.len(),
+                    rows * cfg.hidden
+                ));
+            }
+            for v in c {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        fs::write(path, &b).map_err(|e| format!("{path}: {e}"))?;
+        println!(
+            "capture     {} floats ({} layers x {} positions x {}) written to {}",
+            b.len(),
+            capture_layers.len(),
+            rows,
+            cfg.hidden,
+            path
+        );
     }
 
     let best = Model::top(&logits_last, topn);

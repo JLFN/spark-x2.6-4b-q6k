@@ -2,8 +2,10 @@
 //!
 //! One `<tensor>.bin` per tensor next to a manifest.txt:
 //!
-//!     # name rows cols stages file_bytes relL2
-//!     model.layers.0.mlp.down_proj.weight 2560 10240 2 21440592 3.2789
+//! ```text
+//! # name rows cols stages file_bytes relL2
+//! model.layers.0.mlp.down_proj.weight 2560 10240 2 21440592 3.2789
+//! ```
 //!
 //! Two-dimensional tensors decode through the shared vq-format reader; the
 //! 1-D norms are RQVF raw f32 sidecars (stages 0 in the manifest). The manifest
