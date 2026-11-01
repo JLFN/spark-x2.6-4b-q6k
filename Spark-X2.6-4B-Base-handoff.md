@@ -83,9 +83,9 @@ result. Where a number is missing it says so.
   done: vq-model-gpu captures the target layer inputs, runs the draft on the
   same device through cuBLAS, verifies a batch and rolls the committed prefix
   forward. Gate 1 passes bitwise, the GPU ids are identical to the CPU VQ
-  spec ids, and the bench measures 89.25 tok/s against a 70.81 tok/s greedy
-  baseline (1.29x) with a 50.3% break-even acceptance against the measured
-  68.831%.
+  spec ids, and the bench measures 85.96-89.25 tok/s against a 69.40-70.81
+  tok/s greedy baseline (1.25-1.29x) with a 50.3-52.1% break-even acceptance
+  against the measured 68.831%.
 
 ## 2. Measurements (do not re-derive)
 
@@ -287,14 +287,14 @@ tools/vq/gpu/dspark-gpu.h), same prompt and target:
     GPU spec, 64 generated ids
         ids byte-identical to the CPU VQ spec ids above
         11 rounds, 77 drafted, 53 accepted, acceptance 68.831%
-        decode 0.72 s after the target load, 89.25 tok/s committed
-        round 63.8 ms (draft 13.9 ms, verify 49.6 ms)
+        decode 0.72-0.74 s after the target load, 85.96-89.25 tok/s
+        round 63.8-66.9 ms (draft 13.9-14.2 ms, verify 49.6-52.4 ms)
     gate 1, four blocks with different anchors in two orders
         28 rows x 131072 logits, maxabs 0, no argmax or proposal mismatch
     baseline, same process and device
-        70.81 tok/s greedy (14.1 ms/token)
-        speedup 1.29x at the measured acceptance
-        break-even acceptance 50.3% per drafted token (measured 68.831%)
+        69.40-70.81 tok/s greedy (14.1-14.4 ms/token)
+        speedup 1.25-1.29x at the measured acceptance
+        break-even acceptance 50.3-52.1% per drafted token (measured 68.831%)
     trap: verify_logits must use the same per-row GEMV as tail_logits for
         the tied head. Routing the 8-row verify logits through prefill_mat
         changed the first token from 19500 to 220; the per-row GEMV matches
@@ -484,8 +484,8 @@ stay in the per-round row buffer.
      forward_batch, accept the longest common prefix, repeat. Greedy only until
      the acceptance number exists.
    - Acceptance for phase C: met. The GPU ids are byte-identical to the CPU
-     VQ spec ids at temperature 0; the end-to-end rate is 89.25 tok/s against
-     the 70.81 tok/s greedy baseline, with acceptance 68.831%.
+     VQ spec ids at temperature 0; the end-to-end rate is 85.96-89.25 tok/s
+     against the 69.40-70.81 tok/s greedy baseline, with acceptance 68.831%.
 
    Phase D, measurement and the decision. DONE 2026-11-01.
 
@@ -496,10 +496,10 @@ stay in the per-round row buffer.
    The bench runs the spec path and the plain greedy baseline in one process
    and reports acceptance, accepted and committed tokens per round, draft ms,
    verify ms, tok/s and the break-even acceptance for the measured round
-   cost. The measured break-even is 50.3% per drafted token; the measured
-   acceptance is 68.831%, so the feature is a 1.29x win on this target. The
-   earlier ~0.3 estimate was optimistic because the draft block costs
-   13.9 ms, not the 4-6 ms assumed in section 2.
+   cost. The measured break-even is 50.3-52.1% per drafted token; the
+   measured acceptance is 68.831%, so the feature is a 1.25-1.29x win on this
+   target. The earlier ~0.3 estimate was optimistic because the draft block
+   costs 13.9-14.2 ms, not the 4-6 ms assumed in section 2.
 
 2. Prefill micro-tuning in the GPU model runtime. The tiled prefill is wired
    and gated (section 2), and the tile shapes are now measured per geometry

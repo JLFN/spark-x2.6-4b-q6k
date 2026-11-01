@@ -796,11 +796,12 @@ Measured gates, 2026-10-31:
 - Gate 1, batch permutation invariance: four blocks with different anchors
   run in one batch and then in a permuted batch; maxabs 0 over 28 rows of
   131072 logits, no argmax or proposal mismatch.
-- Phase D bench, same prompt and device: spec 89.25 tok/s against a 70.81
-  tok/s greedy baseline (1.29x), round 63.8 ms (draft 13.9 ms, verify 49.6
-  ms), break-even acceptance 50.3% per drafted token against the measured
-  68.8%. The handoff's earlier ~0.3 estimate was optimistic: the measured
-  draft cost puts break-even at 50.3%, and 68.8% still clears it.
+- Phase D bench, same prompt and device, two runs: spec 85.96-89.25 tok/s
+  against a 69.40-70.81 tok/s greedy baseline (1.25-1.29x), round 63.8-66.9
+  ms (draft 13.9-14.2 ms, verify 49.6-52.4 ms), break-even acceptance
+  50.3-52.1% per drafted token against the measured 68.8%. The handoff's
+  earlier ~0.3 estimate was optimistic: the measured draft cost puts
+  break-even at 50-52%, and 68.8% still clears it.
 
 Gate 1 is met. The GPU block decoder runs four independent blocks in one
 batch, then the same blocks in a permuted order; the logits are bit-identical
