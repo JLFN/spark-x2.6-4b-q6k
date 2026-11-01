@@ -978,7 +978,7 @@ static int argmax_dev(const Model * m) {
     return best;
 }
 
-#include "dspark-gpu.cuh"
+#include "dspark-gpu.h"
 
 /* ------------------------------------------------------------------ main -- */
 

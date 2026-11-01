@@ -721,7 +721,7 @@ implemented. The reader, the dump, the converter, the checker, the CPU draft
 forward and the CPU propose/verify loop are phase A/B. Phase C is the GPU
 executor: vq-model-gpu captures the target layer-input rows at layers 3, 11,
 19, 26 and 34 into a position-major device buffer, verify_logits returns the
-tied-head logits for every row of a verification batch, and dspark-gpu.cuh
+tied-head logits for every row of a verification batch, and dspark-gpu.h
 runs the feature encoder, the block decoder (S independent blocks), the
 Markov chain and the confidence head on the same device. The draft weights
 are loaded as f32 from the manifest and multiplied with cuBLAS, so the GPU
@@ -836,7 +836,7 @@ batch, then the same blocks in a permuted order; the logits are bit-identical
     tools/vq/gpu/decode-gpu.cu  CUDA decode, GEMV, tiled prefill kernels
     tools/vq/gpu/decode-gpu.c   driver: per-tensor bench and `--manifest` bench
     tools/vq/gpu/vq-model-gpu.cu  whole-model GPU runtime (bin/vq-model-gpu)
-    tools/vq/gpu/dspark-gpu.cuh  GPU draft executor, gates and bench (phases C/D)
+    tools/vq/gpu/dspark-gpu.h    GPU draft executor, gates and bench (phases C/D)
     tools/vq/gpu/vq-profile.h   tuning profile format, fingerprint and reader
     tools/vq-tune/      per-model, per-kernel tuner (bin/vq-tune, section 8c)
     tools/dspark/       DSpark draft reader, converter and checker (bin/dspark, section 8d)

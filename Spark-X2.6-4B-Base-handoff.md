@@ -280,7 +280,7 @@ The first-block gate also matches on both captures: proposals
 differ slightly (CPU f32 against CUDA BF16), every argmax is identical.
 
 Draft phase C/D gate, MEASURED 2026-11-01 on the GPU chain (vq-model-gpu,
-tools/vq/gpu/dspark-gpu.cuh), same prompt and target:
+tools/vq/gpu/dspark-gpu.h), same prompt and target:
 
     GPU spec, 64 generated ids
         ids byte-identical to the CPU VQ spec ids above

@@ -1,4 +1,4 @@
-/* dspark-gpu.cuh — the DSpark draft executor on the same device as the target.
+/* dspark-gpu.h — the DSpark draft executor on the same device as the target.
  *
  * Included by vq-model-gpu.cu after the target Model, its Mat loader, gemv,
  * forward_batch, verify_logits and capture support are defined. Every
